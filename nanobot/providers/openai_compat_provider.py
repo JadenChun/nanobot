@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import hashlib
+import json
 import os
 import secrets
 import string
@@ -35,6 +36,27 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+
+# Model families that use the "reasoning" request shape: they require
+# `max_completion_tokens` instead of `max_tokens` and reject custom
+# `temperature` values. Detection is by model id (post prefix-strip) so it
+# applies regardless of which provider hosts the model (OpenAI direct,
+# GitHub Copilot, Azure, OpenRouter, etc.).
+_REASONING_MODEL_PREFIXES: tuple[str, ...] = (
+    "o1", "o3", "o4",
+    "gpt-5",
+)
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """True if the model uses the OpenAI "reasoning" request shape."""
+    if not model_name:
+        return False
+    bare = model_name.split("/")[-1].lower()
+    for prefix in _REASONING_MODEL_PREFIXES:
+        if bare == prefix or bare.startswith(prefix + "-") or bare.startswith(prefix + "."):
+            return True
+    return False
 
 
 def _short_tool_id() -> str:
@@ -126,6 +148,7 @@ class OpenAICompatProvider(LLMProvider):
         rate_limit: int = 0,
         timeout: float = 60.0,
         spec: ProviderSpec | None = None,
+        token_provider: Callable[[], str] | None = None,
     ):
         key_pool = [k for k in (api_keys or []) if k]
         if not key_pool and api_key:
@@ -134,6 +157,7 @@ class OpenAICompatProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
+        self._token_provider = token_provider
         self._api_keys = key_pool
         self._request_start_index = 0
         self._preferred_key_index: int | None = 0 if key_pool else None
@@ -143,7 +167,16 @@ class OpenAICompatProvider(LLMProvider):
         self._request_timestamps: collections.deque[float] = collections.deque()
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
-        default_headers = {"x-session-affinity": uuid.uuid4().hex}
+        self._is_opencode_go = bool(spec and spec.name == "opencode_go")
+        self._opencode_session_id = uuid.uuid4().hex
+        if self._is_opencode_go:
+            default_headers = {
+                "x-opencode-session": self._opencode_session_id,
+                "x-opencode-client": "nanobot",
+                "User-Agent": "nanobot",
+            }
+        else:
+            default_headers = {"x-session-affinity": self._opencode_session_id}
         if _uses_openrouter_attribution(spec, effective_base):
             default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
@@ -258,6 +291,11 @@ class OpenAICompatProvider(LLMProvider):
         if self._api_keys:
             resolved_index = 0 if key_index is None else (key_index % len(self._api_keys))
             active_key = self._api_keys[resolved_index]
+        if self._token_provider is not None:
+            try:
+                active_key = self._token_provider()
+            except Exception as exc:
+                raise RuntimeError(f"Failed to obtain auth token: {exc}") from exc
         if active_key and self._spec and self._spec.env_key:
             self._setup_env(active_key, self.api_base)
         return AsyncOpenAI(
@@ -320,8 +358,6 @@ class OpenAICompatProvider(LLMProvider):
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
         """Return True when exception indicates quota/rate limiting or temporary overload."""
-        if isinstance(exc, TimeoutError):
-            return True
         status = getattr(exc, "status_code", None)
         if status is None:
             resp = getattr(exc, "response", None)
@@ -457,7 +493,7 @@ class OpenAICompatProvider(LLMProvider):
         tools: list[dict[str, Any]] | None,
         model: str | None,
         max_tokens: int,
-        temperature: float,
+        temperature: float | None,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
     ) -> dict[str, Any]:
@@ -477,13 +513,22 @@ class OpenAICompatProvider(LLMProvider):
                 "Please use another OpenCode Go model for now."
             )
 
+        messages = self._split_tool_images_from_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
-            "temperature": temperature,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
 
-        if spec and getattr(spec, "supports_max_completion_tokens", False):
+        reasoning_model = _is_reasoning_model(model_name)
+        if reasoning_model:
+            # Reasoning models (o1/o3/o4/gpt-5 family) reject `max_tokens` and
+            # custom `temperature`; they require `max_completion_tokens` and
+            # only accept the default temperature.
+            kwargs["max_completion_tokens"] = max(1, max_tokens)
+            kwargs.pop("temperature", None)
+        elif spec and getattr(spec, "supports_max_completion_tokens", False):
             kwargs["max_completion_tokens"] = max(1, max_tokens)
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
@@ -502,7 +547,477 @@ class OpenAICompatProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
+        if self._is_opencode_go:
+            kwargs["extra_headers"] = {
+                "x-opencode-request": uuid.uuid4().hex,
+            }
+            # MiMo and DeepSeek models don't support custom temperature; match
+            # opencode TUI behavior (transform.ts::temperature()).
+            if not any(p in model_lower for p in ("glm", "kimi", "qwen", "minimax")):
+                kwargs.pop("temperature", None)
+
         return kwargs
+
+    # ------------------------------------------------------------------
+    # Responses API (/v1/responses)
+    # ------------------------------------------------------------------
+    #
+    # Some providers (notably GitHub Copilot) require the Responses API for
+    # reasoning models when function tools are attached — chat/completions
+    # rejects `reasoning_effort` in that combination with:
+    #   "Function tools with reasoning_effort are not supported for gpt-5.x
+    #    in /v1/chat/completions. Please use /v1/responses instead."
+    # We route there only for reasoning-model requests on opted-in specs so
+    # the existing chat/completions code path keeps handling everything else.
+
+    def _should_use_responses_api(self, model_name: str) -> bool:
+        spec = self._spec
+        if not spec or not getattr(spec, "use_responses_api", False):
+            return False
+        return _is_reasoning_model(model_name)
+
+    @staticmethod
+    def _stringify_tool_output(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    # Skip image blocks — they're carried separately as
+                    # synthetic user input_image items (see _split_tool_images).
+                    if item.get("type") in ("image_url", "input_image"):
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                        continue
+                    parts.append(json.dumps(item, ensure_ascii=False))
+                elif isinstance(item, str):
+                    parts.append(item)
+                else:
+                    parts.append(str(item))
+            return "".join(parts)
+
+    @staticmethod
+    def _extract_image_data_url(block: Any) -> str | None:
+        """Return the data URL string from a chat-completions image_url block."""
+        if not isinstance(block, dict):
+            return None
+        if block.get("type") != "image_url":
+            return None
+        iu = block.get("image_url")
+        if isinstance(iu, str):
+            return iu
+        if isinstance(iu, dict):
+            url = iu.get("url")
+            if isinstance(url, str):
+                return url
+        return None
+
+    @classmethod
+    def _split_tool_images(cls, content: Any) -> list[str]:
+        """Return any image data URLs embedded in a tool message's content."""
+        if not isinstance(content, list):
+            return []
+        urls: list[str] = []
+        for item in content:
+            url = cls._extract_image_data_url(item)
+            if url:
+                urls.append(url)
+        return urls
+
+    @classmethod
+    def _split_tool_images_from_messages(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Split image_url blocks out of tool messages into user messages.
+
+        Some providers (e.g. Xiaomi) reject image_url blocks inside
+        role=tool messages.  This mirrors what the Responses API path already
+        does (see ``_messages_to_responses_input``), keeping the chat
+        completions path compatible with the same providers.
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "tool":
+                result.append(msg)
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+            image_urls = cls._split_tool_images(content)
+            if not image_urls:
+                result.append(msg)
+                continue
+            text_only: list[Any] = [
+                item for item in content
+                if not (isinstance(item, dict) and item.get("type") == "image_url")
+            ]
+            tool_msg = dict(msg)
+            tool_msg["content"] = text_only if text_only else "(tool returned image(s))"
+            result.append(tool_msg)
+            user_parts: list[Any] = [
+                {"type": "text",
+                 "text": f"[tool {msg.get('name') or ''} returned the following image(s)]".strip()},
+            ]
+            for url in image_urls:
+                user_parts.append({"type": "image_url", "image_url": {"url": url}})
+            result.append({"role": "user", "content": user_parts})
+        return result
+
+    @classmethod
+    def _content_to_responses_parts(
+        cls,
+        content: Any,
+        role: str,
+    ) -> list[dict[str, Any]] | str | None:
+        """Translate chat-completions content (str/list) to Responses API parts.
+
+        - text blocks become input_text (user/tool) or output_text (assistant).
+        - image_url blocks become input_image with a string data URL (the
+          Responses API rejects the object form `{url: ...}`).
+        """
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return cls._stringify_tool_output(content)
+        text_type = "output_text" if role == "assistant" else "input_text"
+        out: list[dict[str, Any]] = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t == "image_url":
+                    url = cls._extract_image_data_url(item)
+                    if url:
+                        # Responses API: image_url must be a plain string.
+                        out.append({"type": "input_image", "image_url": url})
+                    continue
+                if t in ("text", "input_text", "output_text"):
+                    txt = item.get("text")
+                    if isinstance(txt, str):
+                        out.append({"type": text_type, "text": txt})
+                    continue
+                # Pass through already-Responses-shaped parts unchanged.
+                out.append(item)
+            elif isinstance(item, str):
+                out.append({"type": text_type, "text": item})
+        return out or None
+
+    @staticmethod
+    def _stringify_arguments(arguments: Any) -> str:
+        if arguments is None:
+            return "{}"
+        if isinstance(arguments, str):
+            return arguments
+        try:
+            return json.dumps(arguments, ensure_ascii=False)
+        except TypeError:
+            return str(arguments)
+
+    @classmethod
+    def _messages_to_responses_input(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Translate chat-completions messages to Responses API input items.
+
+        Returns (input_items, instructions). System messages are collapsed
+        into the top-level `instructions` field; tool/assistant tool_calls
+        become typed function_call / function_call_output items.
+        """
+        input_items: list[dict[str, Any]] = []
+        instruction_parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "system":
+                text = cls._stringify_tool_output(content)
+                if text:
+                    instruction_parts.append(text)
+                continue
+            if role == "tool":
+                call_id = msg.get("tool_call_id") or ""
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": cls._stringify_tool_output(content),
+                })
+                # The Responses API has no field for image output on
+                # function_call_output, so any image content returned by a
+                # tool must be re-attached as a subsequent user input_image.
+                image_urls = cls._split_tool_images(content)
+                if image_urls:
+                    parts: list[dict[str, Any]] = [
+                        {"type": "input_text",
+                         "text": f"[tool {msg.get('name') or ''} returned the following image(s)]".strip()},
+                    ]
+                    for url in image_urls:
+                        parts.append({"type": "input_image", "image_url": url})
+                    input_items.append({"role": "user", "content": parts})
+                continue
+            if role == "assistant":
+                converted = cls._content_to_responses_parts(content, role)
+                if isinstance(converted, str) and converted:
+                    input_items.append({
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": converted}],
+                    })
+                elif isinstance(converted, list) and converted:
+                    input_items.append({"role": "assistant", "content": converted})
+                tool_calls = msg.get("tool_calls") or []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id") or "",
+                        "name": fn.get("name") or "",
+                        "arguments": cls._stringify_arguments(fn.get("arguments")),
+                    })
+                continue
+            # user / developer / other
+            converted = cls._content_to_responses_parts(content, role or "user")
+            if converted is None:
+                continue
+            input_items.append({"role": role or "user", "content": converted})
+        instructions = "\n\n".join(p for p in instruction_parts if p) or None
+        return input_items, instructions
+
+    @staticmethod
+    def _tools_to_responses(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Flatten chat-completions function tools to Responses API shape."""
+        if not tools:
+            return None
+        out: list[dict[str, Any]] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                out.append(t)
+                continue
+            if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                fn = t["function"]
+                flat: dict[str, Any] = {
+                    "type": "function",
+                    "name": fn.get("name") or "",
+                }
+                if fn.get("description") is not None:
+                    flat["description"] = fn["description"]
+                params = fn.get("parameters")
+                if params is not None:
+                    flat["parameters"] = params
+                if fn.get("strict") is not None:
+                    flat["strict"] = fn["strict"]
+                out.append(flat)
+            else:
+                # Built-in / non-function tools (web_search, file_search, etc.)
+                # already use the flat Responses shape.
+                out.append(t)
+        return out or None
+
+    @staticmethod
+    def _tool_choice_to_responses(
+        tool_choice: str | dict[str, Any] | None,
+    ) -> str | dict[str, Any] | None:
+        if tool_choice is None:
+            return None
+        if isinstance(tool_choice, str):
+            return tool_choice
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function" and isinstance(tool_choice.get("function"), dict):
+                return {
+                    "type": "function",
+                    "name": tool_choice["function"].get("name") or "",
+                }
+        return tool_choice
+
+    def _build_responses_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        model_name = model or self.default_model
+        spec = self._spec
+        if spec and spec.strip_model_prefix:
+            model_name = model_name.split("/")[-1]
+
+        sanitized = self._sanitize_messages(self._sanitize_empty_content(messages))
+        input_items, instructions = self._messages_to_responses_input(sanitized)
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "input": input_items,
+            "max_output_tokens": max(1, max_tokens),
+        }
+        if instructions:
+            kwargs["instructions"] = instructions
+        if reasoning_effort:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+
+        flat_tools = self._tools_to_responses(tools)
+        if flat_tools:
+            kwargs["tools"] = flat_tools
+            kwargs["tool_choice"] = self._tool_choice_to_responses(tool_choice) or "auto"
+
+        return kwargs
+
+    def _parse_responses(self, response: Any) -> LLMResponse:
+        response_map = self._maybe_mapping(response)
+        output_items: list[Any]
+        if response_map is not None:
+            output_items = response_map.get("output") or []
+            usage_obj = response_map.get("usage")
+            status = response_map.get("status") or response_map.get("incomplete_details") or ""
+        else:
+            output_items = list(getattr(response, "output", None) or [])
+            usage_obj = getattr(response, "usage", None)
+            status = getattr(response, "status", "") or ""
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: list[ToolCallRequest] = []
+
+        for item in output_items:
+            item_map = self._maybe_mapping(item) or {}
+            item_type = item_map.get("type")
+            if item_type == "message":
+                for c in item_map.get("content") or []:
+                    c_map = self._maybe_mapping(c) or {}
+                    c_type = c_map.get("type")
+                    if c_type in ("output_text", "text"):
+                        text = c_map.get("text")
+                        if isinstance(text, str):
+                            content_parts.append(text)
+                    elif c_type == "refusal":
+                        refusal = c_map.get("refusal")
+                        if isinstance(refusal, str):
+                            content_parts.append(refusal)
+            elif item_type == "function_call":
+                raw_args = item_map.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json_repair.loads(raw_args) if raw_args else {}
+                    except Exception:
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                call_id = item_map.get("call_id") or item_map.get("id") or _short_tool_id()
+                tool_calls.append(ToolCallRequest(
+                    id=str(call_id),
+                    name=str(item_map.get("name") or ""),
+                    arguments=args if isinstance(args, dict) else {},
+                ))
+            elif item_type == "reasoning":
+                for s in item_map.get("summary") or []:
+                    s_map = self._maybe_mapping(s) or {}
+                    if s_map.get("type") == "summary_text":
+                        text = s_map.get("text")
+                        if isinstance(text, str):
+                            reasoning_parts.append(text)
+
+        usage_map = self._maybe_mapping(usage_obj) or {}
+        if usage_map:
+            prompt_tokens = int(
+                usage_map.get("input_tokens")
+                or usage_map.get("prompt_tokens")
+                or 0
+            )
+            completion_tokens = int(
+                usage_map.get("output_tokens")
+                or usage_map.get("completion_tokens")
+                or 0
+            )
+            total_tokens = int(
+                usage_map.get("total_tokens")
+                or (prompt_tokens + completion_tokens)
+            )
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+        else:
+            usage = {}
+
+        if tool_calls:
+            finish_reason = "tool_calls"
+        elif status == "incomplete":
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
+
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            reasoning_content="\n".join(reasoning_parts) or None,
+        )
+
+    async def _collect_responses_stream(
+        self,
+        stream: Any,
+        on_content_delta: Callable[[str], Awaitable[None]] | None,
+    ) -> Any:
+        """Consume a Responses API event stream; return the final response object."""
+        final_response: Any = None
+        iterator = stream.__aiter__()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(anext(iterator), timeout=self._request_timeout)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        f"provider stream timed out after {self._request_timeout:.0f}s waiting for the next chunk"
+                    ) from exc
+
+                ev_type = getattr(event, "type", None) or (
+                    event.get("type") if isinstance(event, dict) else None
+                )
+                if ev_type == "response.output_text.delta" and on_content_delta:
+                    delta = getattr(event, "delta", None)
+                    if delta is None and isinstance(event, dict):
+                        delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        await on_content_delta(delta)
+                elif ev_type in ("response.completed", "response.incomplete"):
+                    final_response = getattr(event, "response", None)
+                    if final_response is None and isinstance(event, dict):
+                        final_response = event.get("response")
+                elif ev_type == "response.failed":
+                    err_obj = getattr(event, "response", None) or (
+                        event.get("response") if isinstance(event, dict) else None
+                    )
+                    err_map = self._maybe_mapping(err_obj) or {}
+                    error_info = err_map.get("error") or {}
+                    msg = (
+                        (self._maybe_mapping(error_info) or {}).get("message")
+                        if isinstance(error_info, dict)
+                        else None
+                    ) or str(error_info) or "Responses API request failed"
+                    raise RuntimeError(msg)
+        finally:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    logger.debug("Ignoring stream close failure")
+        return final_response
 
     # ------------------------------------------------------------------
     # Response parsing
@@ -791,10 +1306,18 @@ class OpenAICompatProvider(LLMProvider):
             key_index = key_order[attempt] if self._api_keys else None
             attempted_labels.append(self._key_label(key_index))
             try:
-                kwargs = self._build_kwargs(
-                    messages, tools, model, max_tokens, temperature,
-                    reasoning_effort, tool_choice,
-                )
+                resolved_model = (model or self.default_model) or ""
+                use_responses = self._should_use_responses_api(resolved_model)
+                if use_responses:
+                    kwargs = self._build_responses_kwargs(
+                        messages, tools, model, max_tokens,
+                        reasoning_effort, tool_choice,
+                    )
+                else:
+                    kwargs = self._build_kwargs(
+                        messages, tools, model, max_tokens, temperature,
+                        reasoning_effort, tool_choice,
+                    )
                 await self._wait_for_rate_limit()
                 if len(self._api_keys) > 1:
                     logger.info(
@@ -805,11 +1328,18 @@ class OpenAICompatProvider(LLMProvider):
                         kwargs["model"],
                     )
                 client = self._build_client(key_index)
-                raw = await self._await_with_timeout(
-                    client.chat.completions.create(**kwargs),
-                    phase="request",
-                )
-                response = self._parse(raw)
+                if use_responses:
+                    raw = await self._await_with_timeout(
+                        client.responses.create(**kwargs),
+                        phase="request",
+                    )
+                    response = self._parse_responses(raw)
+                else:
+                    raw = await self._await_with_timeout(
+                        client.chat.completions.create(**kwargs),
+                        phase="request",
+                    )
+                    response = self._parse(raw)
                 self._record_key_success(key_index)
                 if attempt > 0 and self._api_keys:
                     logger.info(
@@ -877,12 +1407,21 @@ class OpenAICompatProvider(LLMProvider):
             key_index = key_order[attempt] if self._api_keys else None
             attempted_labels.append(self._key_label(key_index))
             try:
-                kwargs = self._build_kwargs(
-                    messages, tools, model, max_tokens, temperature,
-                    reasoning_effort, tool_choice,
-                )
+                resolved_model = (model or self.default_model) or ""
+                use_responses = self._should_use_responses_api(resolved_model)
+                if use_responses:
+                    kwargs = self._build_responses_kwargs(
+                        messages, tools, model, max_tokens,
+                        reasoning_effort, tool_choice,
+                    )
+                else:
+                    kwargs = self._build_kwargs(
+                        messages, tools, model, max_tokens, temperature,
+                        reasoning_effort, tool_choice,
+                    )
                 kwargs["stream"] = True
-                kwargs["stream_options"] = {"include_usage": True}
+                if not use_responses:
+                    kwargs["stream_options"] = {"include_usage": True}
                 await self._wait_for_rate_limit()
                 if len(self._api_keys) > 1:
                     logger.info(
@@ -893,12 +1432,24 @@ class OpenAICompatProvider(LLMProvider):
                         kwargs["model"],
                     )
                 client = self._build_client(key_index)
-                stream = await self._await_with_timeout(
-                    client.chat.completions.create(**kwargs),
-                    phase="stream request",
-                )
-                chunks = await self._collect_stream_chunks(stream, effective_delta)
-                response = self._parse_chunks(chunks)
+                if use_responses:
+                    stream = await self._await_with_timeout(
+                        client.responses.create(**kwargs),
+                        phase="stream request",
+                    )
+                    final = await self._collect_responses_stream(stream, effective_delta)
+                    if final is None:
+                        raise RuntimeError(
+                            "Responses API stream ended without a response.completed event"
+                        )
+                    response = self._parse_responses(final)
+                else:
+                    stream = await self._await_with_timeout(
+                        client.chat.completions.create(**kwargs),
+                        phase="stream request",
+                    )
+                    chunks = await self._collect_stream_chunks(stream, effective_delta)
+                    response = self._parse_chunks(chunks)
                 self._record_key_success(key_index)
                 if attempt > 0 and self._api_keys:
                     logger.info(
@@ -916,6 +1467,14 @@ class OpenAICompatProvider(LLMProvider):
                         self._record_key_failure(key_index, e)
                     return self._handle_error(e)
                 has_remaining_keys = attempt + 1 < max_attempts
+                # Timeouts are transient — rotate to next key if available, otherwise
+                # let chat_stream_with_retry handle the retry (not a rate-limit failure).
+                if isinstance(e, TimeoutError):
+                    if has_remaining_keys and self._api_keys:
+                        cooldown_s = self._record_key_failure(key_index, e)
+                        self._log_rotation(key_index or 0, key_order[attempt + 1], e, cooldown_s)
+                        continue
+                    return self._handle_error(e)
                 if has_remaining_keys and self._is_rate_limit_error(e) and self._api_keys:
                     cooldown_s = self._record_key_failure(key_index, e)
                     self._log_rotation(key_index or 0, key_order[attempt + 1], e, cooldown_s)

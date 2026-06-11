@@ -97,6 +97,15 @@ class CronTool(Tool):
                         f"(e.g. '2026-02-12T10:30:00'). Naive values default to {self._default_timezone}."
                     ),
                 },
+                "planning_mode": {
+                    "type": "string",
+                    "enum": ["on", "off", "agent"],
+                    "description": "Override planning mode for this job: 'on' (always plan), 'off' (skip planner), 'agent' (agent decides). Default: use global setting.",
+                },
+                "skip_verification": {
+                    "type": "boolean",
+                    "description": "Skip the verification phase after action execution. Default: false.",
+                },
                 "job_id": {"type": "string", "description": "Job ID (for remove)"},
             },
             "required": ["action"],
@@ -111,12 +120,14 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        planning_mode: str | None = None,
+        skip_verification: bool = False,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, planning_mode, skip_verification)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -130,6 +141,8 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        planning_mode: str | None = None,
+        skip_verification: bool = False,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -175,6 +188,8 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
+            planning_mode=planning_mode,
+            skip_verification=skip_verification,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

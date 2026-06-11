@@ -205,7 +205,11 @@ async def test_non_transient_error_with_images_retries_without_images() -> None:
         content = msg.get("content")
         if isinstance(content, list):
             assert all(b.get("type") != "image_url" for b in content)
-            assert any("[image: /media/test.png]" in (b.get("text") or "") for b in content)
+            assert any(
+                "IMAGE DROPPED" in (b.get("text") or "")
+                and "/media/test.png" in (b.get("text") or "")
+                for b in content
+            )
 
 
 @pytest.mark.asyncio
@@ -240,7 +244,7 @@ async def test_image_fallback_returns_error_on_second_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
-    """When _meta is absent, fallback placeholder is '[image omitted]'."""
+    """When _meta is absent, fallback placeholder warns the agent it cannot see the image."""
     provider = ScriptedProvider([
         LLMResponse(content="error", finish_reason="error"),
         LLMResponse(content="ok"),
@@ -254,4 +258,96 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
     for msg in msgs_on_retry:
         content = msg.get("content")
         if isinstance(content, list):
-            assert any("[image omitted]" in (b.get("text") or "") for b in content)
+            assert any("IMAGE DROPPED" in (b.get("text") or "") for b in content)
+
+
+@pytest.mark.asyncio
+async def test_payload_too_large_error_uses_payload_specific_warning() -> None:
+    """413/payload-too-large errors produce a payload-specific placeholder, not vision-rejection text."""
+    provider = ScriptedProvider([
+        LLMResponse(content="Error: Request Entity Too Large", finish_reason="error"),
+        LLMResponse(content="ok"),
+    ])
+
+    response = await provider.chat_with_retry(messages=_IMAGE_MSG)
+
+    assert response.content == "ok"
+    assert provider.calls == 2
+    msgs_on_retry = provider.last_kwargs["messages"]
+    payload_warning_found = False
+    for msg in msgs_on_retry:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for b in content:
+                text = b.get("text") or ""
+                if "IMAGE DROPPED" in text and "payload" in text.lower():
+                    payload_warning_found = True
+    assert payload_warning_found, "expected payload-too-large specific warning in placeholder"
+
+
+def _image_block(path: str) -> dict:
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,abc-{path}"},
+        "_meta": {"path": path},
+    }
+
+
+@pytest.mark.asyncio
+async def test_prune_old_images_keeps_only_most_recent() -> None:
+    """Sliding window keeps the most-recent image and replaces older ones with a placeholder."""
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look"}, _image_block("/a.png")]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "now this"}, _image_block("/b.png")]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "and this"}, _image_block("/c.png")]},
+    ]
+
+    response = await provider.chat_with_retry(messages=messages)
+
+    assert response.content == "ok"
+    sent = provider.last_kwargs["messages"]
+
+    image_blocks = []
+    placeholders = []
+    for msg in sent:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "image_url":
+                    image_blocks.append(b)
+                elif isinstance(b, dict) and b.get("type") == "text":
+                    text = b.get("text") or ""
+                    if "earlier screenshot omitted" in text:
+                        placeholders.append(text)
+
+    # Default _IMAGE_HISTORY_KEEP is 1 → only newest image survives.
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["_meta"]["path"] == "/c.png"
+    assert len(placeholders) == 2
+    assert any("/a.png" in p for p in placeholders)
+    assert any("/b.png" in p for p in placeholders)
+
+
+@pytest.mark.asyncio
+async def test_prune_old_images_noop_when_under_budget() -> None:
+    """When image count is within budget, messages are passed through unchanged."""
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "one"}, _image_block("/only.png")]},
+    ]
+
+    response = await provider.chat_with_retry(messages=messages)
+
+    assert response.content == "ok"
+    sent = provider.last_kwargs["messages"]
+    images = [
+        b for msg in sent
+        if isinstance(msg.get("content"), list)
+        for b in msg["content"]
+        if isinstance(b, dict) and b.get("type") == "image_url"
+    ]
+    assert len(images) == 1
+    assert images[0]["_meta"]["path"] == "/only.png"

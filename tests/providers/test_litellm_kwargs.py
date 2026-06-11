@@ -592,9 +592,11 @@ async def test_single_key_rate_limit_emits_canonical_exhaustion_message() -> Non
     assert LLMProvider._is_quota_exhaustion(result.content) is True
 
 
-def test_local_timeout_classified_as_rate_limit_via_isinstance() -> None:
-    """A bare TimeoutError (no helpful string) must be classified as a rate-limit
-    error and get the overload cooldown — without relying on substring matching."""
+def test_local_timeout_not_classified_as_rate_limit() -> None:
+    """A bare TimeoutError is no longer classified as a rate-limit error.
+    It is a transient network issue that chat_stream_with_retry handles
+    with its own retry logic. Key rotation cooldown still applies for
+    multi-key scenarios via the separate timeout path in chat_stream."""
     spec = find_by_name("gemini")
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider(
@@ -604,8 +606,8 @@ def test_local_timeout_classified_as_rate_limit_via_isinstance() -> None:
             spec=spec,
         )
 
-    err = TimeoutError("")  # no "timeout" substring to match on
-    assert OpenAICompatProvider._is_rate_limit_error(err) is True
+    err = TimeoutError("")
+    assert OpenAICompatProvider._is_rate_limit_error(err) is False
     assert provider._cooldown_seconds_for_error(err) == OpenAICompatProvider._OVERLOAD_KEY_COOLDOWN_S
 
 

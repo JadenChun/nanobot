@@ -146,6 +146,88 @@ def test_recent_legal_messages_strips_orphan_tool_prefix(tmp_path):
     ]
 
 
+def test_summarize_history_for_verifier_ends_with_user_message(tmp_path):
+    """Verifier must produce a request that ends with a user role.
+
+    Some strict providers (Copilot's Claude proxy) reject requests ending
+    with an assistant message ("This model does not support assistant
+    message prefill."). The summarizer collapses prior turns into a single
+    user message so the verifier always satisfies this constraint.
+    """
+    loop, _provider = _make_loop(tmp_path)
+    messages = [
+        {"role": "user", "content": "please change the active app"},
+        {
+            "role": "assistant",
+            "content": "I'll take a screenshot first.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "desktop_use", "arguments": '{"action":"screenshot"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "desktop_use",
+            "content": [
+                {"type": "text", "text": "Screenshot saved."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        },
+        {"role": "assistant", "content": "Done!"},
+    ]
+
+    summarized = loop._summarize_history_for_verifier(messages)
+
+    assert len(summarized) == 1
+    assert summarized[0]["role"] == "user"
+    # The summarized message must contain the narrative.
+    content = summarized[0]["content"]
+    if isinstance(content, list):
+        text = next((b["text"] for b in content if b.get("type") == "text"), "")
+        # The most recent screenshot is preserved as an image_url block.
+        assert any(b.get("type") == "image_url" for b in content)
+    else:
+        text = content
+    assert "USER" in text
+    assert "ASSISTANT" in text
+    assert "desktop_use" in text
+    assert "Done!" in text
+
+
+def test_summarize_history_for_verifier_handles_empty_messages(tmp_path):
+    loop, _provider = _make_loop(tmp_path)
+    assert loop._summarize_history_for_verifier([]) == []
+
+
+def test_summarize_history_for_verifier_caps_image_blocks(tmp_path):
+    loop, _provider = _make_loop(tmp_path)
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": f"c{i}",
+            "name": "desktop_use",
+            "content": [
+                {"type": "text", "text": f"shot {i}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{i}"}},
+            ],
+        }
+        for i in range(5)
+    ]
+    summarized = loop._summarize_history_for_verifier(messages, max_image_blocks=2)
+    assert len(summarized) == 1
+    content = summarized[0]["content"]
+    assert isinstance(content, list)
+    image_blocks = [b for b in content if b.get("type") == "image_url"]
+    assert len(image_blocks) == 2
+    # The two retained images should be the most recent.
+    assert image_blocks[0]["image_url"]["url"].endswith(",3")
+    assert image_blocks[1]["image_url"]["url"].endswith(",4")
+
+
 @pytest.mark.asyncio
 async def test_runner_tool_policy_can_stop_before_execution():
     class StopPolicy(ToolPolicy):
@@ -537,7 +619,7 @@ async def test_process_direct_injects_richer_planner_handoff_into_action(tmp_pat
 async def test_plan_result_emits_one_user_facing_plan_message_and_does_not_persist_it(tmp_path):
     loop, _provider = _make_loop(tmp_path, planning_mode="agent")
     loop.channels_config = ChannelsConfig(task_update_mode="plan_result")
-    loop._should_plan = MagicMock(return_value=True)  # type: ignore[method-assign]
+    loop._should_plan_with_mode = MagicMock(return_value=True)  # type: ignore[method-assign]
 
     loop._run_internal_planner = AsyncMock(return_value=  # type: ignore[method-assign]
         _PlanDecision(
@@ -602,7 +684,7 @@ async def test_plan_result_skips_plan_message_when_planning_is_skipped(tmp_path)
 async def test_plan_result_does_not_emit_second_plan_message_after_approval_resume(tmp_path):
     loop, _provider = _make_loop(tmp_path, planning_mode="agent")
     loop.channels_config = ChannelsConfig(task_update_mode="plan_result")
-    loop._should_plan = MagicMock(return_value=True)  # type: ignore[method-assign]
+    loop._should_plan_with_mode = MagicMock(return_value=True)  # type: ignore[method-assign]
     loop._pending_approvals["telegram:123"] = _PendingApproval(
         summary="push commits to a remote repository",
         created_at=0.0,

@@ -23,6 +23,7 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
 from nanobot.agent.tools.agent_device import AgentDeviceTool
+from nanobot.agent.tools.desktop_use import DesktopUseTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.explore import ExploreTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
         AgentBrowserConfig,
         AgentDeviceConfig,
         ChannelsConfig,
+        DesktopUseConfig,
         ExecToolConfig,
         ImageConfig,
         MaxTokensConfig,
@@ -241,6 +243,7 @@ class AgentLoop:
         web_proxy: str | None = None,
         agent_browser_config: AgentBrowserConfig | None = None,
         agent_device_config: AgentDeviceConfig | None = None,
+        desktop_use_config: "DesktopUseConfig | None" = None,
         exec_config: ExecToolConfig | None = None,
         image_config: ImageConfig | None = None,
         cron_service: CronService | None = None,
@@ -263,6 +266,7 @@ class AgentLoop:
         from nanobot.config.schema import (
             AgentBrowserConfig,
             AgentDeviceConfig,
+            DesktopUseConfig,
             ExecToolConfig,
             ImageConfig,
             MaxTokensConfig,
@@ -286,6 +290,7 @@ class AgentLoop:
         self.web_proxy = web_proxy
         self.agent_browser_config = agent_browser_config or AgentBrowserConfig()
         self.agent_device_config = agent_device_config or AgentDeviceConfig()
+        self.desktop_use_config = desktop_use_config or DesktopUseConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.image_config = image_config or ImageConfig()
         self.cron_service = cron_service
@@ -328,6 +333,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             agent_browser_config=self.agent_browser_config,
             agent_device_config=self.agent_device_config,
+            desktop_use_config=self.desktop_use_config,
             exec_config=self.exec_config,
             image_config=self.image_config,
             context_paths=self.context_paths,
@@ -413,6 +419,7 @@ class AgentLoop:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 resource_policy=self.resource_policy,
+                desktop_use_active=self.desktop_use_config.enabled,
             ))
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -430,6 +437,14 @@ class AgentLoop:
                 package=self.agent_device_config.package,
                 timeout=self.agent_device_config.timeout,
                 max_output_chars=self.agent_device_config.max_output_chars,
+                working_dir=str(self.workspace),
+            ))
+        if self.desktop_use_config.enabled:
+            self.tools.register(DesktopUseTool(
+                screenshot_delay=self.desktop_use_config.screenshot_delay,
+                typing_delay_ms=self.desktop_use_config.typing_delay_ms,
+                scaling_enabled=self.desktop_use_config.scaling_enabled,
+                max_output_chars=self.desktop_use_config.max_output_chars,
                 working_dir=str(self.workspace),
             ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
@@ -454,6 +469,7 @@ class AgentLoop:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 resource_policy=self.resource_policy,
+                desktop_use_active=self.desktop_use_config.enabled,
             ))
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -575,6 +591,232 @@ class AgentLoop:
         sliced = messages[-max_messages:] if max_messages > 0 else list(messages)
         start = cls._find_legal_message_start(sliced)
         return sliced[start:] if start else sliced
+
+    @staticmethod
+    def _flatten_unknown_tool_exchanges(
+        messages: list[dict[str, Any]],
+        known_tool_names: set[str],
+    ) -> list[dict[str, Any]]:
+        """Rewrite assistant/tool exchanges referencing unknown tools into plain text.
+
+        When the verifier (or any read-only secondary pass) replays a session
+        history that called tools not present in *its* tool registry, strict
+        providers (notably the GitHub Copilot OpenAI-compatible proxy) reject
+        the request with HTTP 400 because the history references tool names
+        the model wasn't told about.
+
+        This collapses any assistant message whose ``tool_calls`` reference at
+        least one unknown tool into a plain assistant text message, and
+        rewrites the matching ``tool`` result messages into ``user`` text
+        notes with the same content. Known-tool exchanges are left intact so
+        the verifier can still reason about them naturally.
+        """
+        if not messages:
+            return messages
+
+        # Pass 1: figure out which tool_call_ids belong to "unknown" assistant calls.
+        unknown_tool_call_ids: set[str] = set()
+        rewritten_assistant: dict[int, dict[str, Any]] = {}
+        for idx, msg in enumerate(messages):
+            if msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                continue
+            has_unknown = False
+            names: list[str] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                name = (tc.get("function") or {}).get("name") or tc.get("name") or "?"
+                names.append(str(name))
+                if name not in known_tool_names:
+                    has_unknown = True
+                    if tc.get("id"):
+                        unknown_tool_call_ids.add(str(tc["id"]))
+            if not has_unknown:
+                continue
+            # Build a narrative replacement for this assistant turn.
+            original_content = msg.get("content")
+            if isinstance(original_content, list):
+                text_parts = [
+                    b.get("text", "")
+                    for b in original_content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                base_text = "\n".join(t for t in text_parts if t).strip()
+            else:
+                base_text = (original_content or "").strip() if isinstance(original_content, str) else ""
+            summary = f"[Prior tool calls: {', '.join(names)}]"
+            new_text = f"{base_text}\n\n{summary}".strip() if base_text else summary
+            rewritten_assistant[idx] = {"role": "assistant", "content": new_text}
+
+        if not rewritten_assistant and not unknown_tool_call_ids:
+            return messages
+
+        # Pass 2: emit rewritten history.
+        result: list[dict[str, Any]] = []
+        for idx, msg in enumerate(messages):
+            if idx in rewritten_assistant:
+                result.append(rewritten_assistant[idx])
+                continue
+            if msg.get("role") == "tool":
+                tcid = msg.get("tool_call_id")
+                if tcid and str(tcid) in unknown_tool_call_ids:
+                    # Convert orphaned tool result into a plain user note so
+                    # the verifier still sees the output without referencing
+                    # an unknown tool schema. Preserve image_url blocks so the
+                    # verifier can still see screenshots (image pruner upstream
+                    # trims older ones).
+                    raw_content = msg.get("content")
+                    name = msg.get("name") or "tool"
+                    new_blocks: list[Any] = []
+                    if isinstance(raw_content, list):
+                        text_parts: list[str] = []
+                        image_blocks: list[dict[str, Any]] = []
+                        for b in raw_content:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get("type") == "text":
+                                text_parts.append(b.get("text") or "")
+                            elif b.get("type") == "image_url":
+                                image_blocks.append(b)
+                        text = "\n".join(t for t in text_parts if t).strip() or "(empty tool result)"
+                        new_blocks.append({"type": "text", "text": f"[Result of prior {name} call]\n{text}"})
+                        new_blocks.extend(image_blocks)
+                    elif isinstance(raw_content, str):
+                        new_blocks = [{"type": "text", "text": f"[Result of prior {name} call]\n{raw_content}"}]
+                    else:
+                        new_blocks = [{"type": "text", "text": f"[Result of prior {name} call]\n(empty tool result)"}]
+
+                    if len(new_blocks) == 1 and new_blocks[0].get("type") == "text":
+                        result.append({"role": "user", "content": new_blocks[0]["text"]})
+                    else:
+                        result.append({"role": "user", "content": new_blocks})
+                    continue
+            result.append(msg)
+        return result
+
+    @staticmethod
+    def _summarize_history_for_verifier(
+        messages: list[dict[str, Any]],
+        *,
+        max_image_blocks: int = 1,
+        max_text_chars: int = 6000,
+    ) -> list[dict[str, Any]]:
+        """Collapse an action conversation into a single narrative user message.
+
+        The verifier runs against strict providers (e.g. GitHub Copilot's
+        OpenAI-compat proxy) that reject conversation histories whose
+        ``tool_calls`` reference tool names not registered in the current
+        request. Even when we try to flatten unknown-tool exchanges, the
+        replayed history is large enough — and shaped specifically enough —
+        that some proxies still return HTTP 400.
+
+        To sidestep all of that, build a single ``user`` message that:
+
+        * narrates each assistant text turn,
+        * lists the tool calls that happened with a short args preview,
+        * inlines short tool-result text,
+        * keeps at most ``max_image_blocks`` of the most recent screenshots
+          attached as ``image_url`` blocks (so vision-capable verifiers can
+          still inspect the final state).
+
+        Returns a list with zero or one message ready to splice after the
+        verifier's system/user instructions.
+        """
+        if not messages:
+            return []
+
+        narrative_lines: list[str] = ["[Action-phase transcript follows]"]
+        # Walk from oldest to newest, collecting text. Collect image blocks
+        # separately and we'll keep the last N at the end.
+        image_blocks: list[dict[str, Any]] = []
+
+        def _truncate(text: str, limit: int = 500) -> str:
+            text = (text or "").strip()
+            if len(text) <= limit:
+                return text
+            return text[:limit] + "…"
+
+        def _arg_preview(args: Any) -> str:
+            if isinstance(args, str):
+                return _truncate(args, 120)
+            try:
+                import json as _json
+                return _truncate(_json.dumps(args, ensure_ascii=False), 120)
+            except Exception:
+                return _truncate(str(args), 120)
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "system":
+                # Skip system messages; the verifier has its own.
+                continue
+            if role == "user":
+                if isinstance(content, str) and content.strip():
+                    narrative_lines.append(f"USER: {_truncate(content, 1500)}")
+                elif isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text" and b.get("text"):
+                            narrative_lines.append(f"USER: {_truncate(b['text'], 1500)}")
+                        elif b.get("type") == "image_url":
+                            image_blocks.append(b)
+            elif role == "assistant":
+                text_part = ""
+                if isinstance(content, str):
+                    text_part = content
+                elif isinstance(content, list):
+                    text_part = "\n".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                text_part = text_part.strip()
+                if text_part:
+                    narrative_lines.append(f"ASSISTANT: {_truncate(text_part, 1500)}")
+                tool_calls = msg.get("tool_calls") or []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    name = (tc.get("function") or {}).get("name") or tc.get("name") or "?"
+                    raw_args = (tc.get("function") or {}).get("arguments") or tc.get("arguments")
+                    narrative_lines.append(f"  → tool_call {name}({_arg_preview(raw_args)})")
+            elif role == "tool":
+                name = msg.get("name") or "tool"
+                if isinstance(content, str):
+                    narrative_lines.append(f"  ← {name} result: {_truncate(content, 600)}")
+                elif isinstance(content, list):
+                    text_parts: list[str] = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text" and b.get("text"):
+                            text_parts.append(b["text"])
+                        elif b.get("type") == "image_url":
+                            image_blocks.append(b)
+                    joined = "\n".join(text_parts).strip()
+                    if joined:
+                        narrative_lines.append(f"  ← {name} result: {_truncate(joined, 600)}")
+                    else:
+                        narrative_lines.append(f"  ← {name} result: [non-text content]")
+
+        narrative = "\n".join(narrative_lines)
+        if len(narrative) > max_text_chars:
+            # Keep the tail (most recent activity is most relevant for verification).
+            narrative = "[…truncated earlier history…]\n" + narrative[-max_text_chars:]
+
+        # Keep only the most recent N image blocks.
+        tail_images = image_blocks[-max_image_blocks:] if max_image_blocks > 0 else []
+        if tail_images:
+            blocks: list[dict[str, Any]] = [{"type": "text", "text": narrative}]
+            blocks.extend(tail_images)
+            return [{"role": "user", "content": blocks}]
+        return [{"role": "user", "content": narrative}]
+
 
     @staticmethod
     def _is_affirmative(text: str) -> bool:
@@ -783,11 +1025,14 @@ class AgentLoop:
         return cleaned.endswith("?")
 
     def _should_plan(self, text: str) -> bool:
-        if self.planning_mode == "off":
+        return self._should_plan_with_mode(text, self.planning_mode)
+
+    def _should_plan_with_mode(self, text: str, mode: str) -> bool:
+        if mode == "off":
             return False
         if self._is_simple_conversation(text):
             return False
-        if self.planning_mode == "on":
+        if mode == "on":
             return True
         return bool(re.search(
             r"\b(fix|update|implement|change|edit|write|create|add|remove|delete|refactor|debug|test|run|search|check|review|plan)\b",
@@ -798,7 +1043,7 @@ class AgentLoop:
     def _should_verify(self, text: str, tools_used: list[str], planned: _PlanDecision | None) -> bool:
         if self.planning_mode == "on" and not self._is_simple_conversation(text):
             return True
-        return any(name in {"write_file", "edit_file", "exec", "spawn", "spawn_pipeline"} for name in tools_used)
+        return any(name in {"write_file", "edit_file", "exec", "spawn", "spawn_pipeline", "desktop_use"} for name in tools_used)
 
     def _tool_result_clear_thresholds(self) -> tuple[int | None, int | None]:
         """Return prompt-token thresholds for compacting stale tool results."""
@@ -836,12 +1081,21 @@ class AgentLoop:
         return f"Plan: {summary}"
 
     def _planner_prompt(self) -> str:
+        planner_tool_names = sorted(self._build_planner_tools().tool_names)
+        executor_only = sorted(set(self.tools.tool_names) - set(planner_tool_names))
+        executor_hint = (
+            ", ".join(executor_only) if executor_only else "(none — planner has direct access to all tools)"
+        )
         return f"""# Internal Planner
 
 You are nanobot's internal planner. Stay focused on coordination: gather enough evidence, draft the execution handoff, and sanity-check it before action begins. Do not modify files or external systems.
 
 ## Workspace
 {self.workspace}
+
+## Action-phase capabilities
+You do NOT call these directly, but the action phase WILL have them in addition to your read-only tools. Choose `execute` whenever the user's request needs any of them — never refuse a request just because you cannot call the tool yourself:
+{executor_hint}
 
 ## Workflow
 Follow this internal loop until the handoff is ready or you run out of planner iterations:
@@ -855,7 +1109,7 @@ Follow this internal loop until the handoff is ready or you run out of planner i
 2. Plan
 - Draft the concrete work the action phase should do.
 - Draft a specific review goal that the verification phase can check.
-- Build a references list with evidence-backed findings instead of a free-form summary.
+- Build a references list with evidence-backed findings. Include the ACTUAL VALUES you gathered (file contents, command outputs) so the action phase can use them directly without re-reading.
 
 3. Review
 - Ask yourself whether the current handoff is ready for action and review without repeating the same research.
@@ -873,10 +1127,11 @@ Follow this internal loop until the handoff is ready or you run out of planner i
 End your response with exactly:
 
 ---PLAN---
-{{"decision":"answer_or_clarify_or_execute","response":"user-facing text when decision is answer/clarify","action_summary":"short concrete execution summary","review_goal":"what the review phase should verify","references":[{{"finding":"concise evidence-backed finding","references":["file: /abs/path/example.py","function: helper_name"],"open_question":"optional unresolved gap"}}]}}
+{{"decision":"answer_or_clarify_or_execute","response":"user-facing text when decision is answer/clarify","action_summary":"short concrete execution summary","review_goal":"what the review phase should verify","references":[{{"finding":"concise description of what was found","value":"the actual value gathered (file content, command output, etc.)","source":"tool_name: arguments or description of how this was gathered","references":["file: /abs/path/example.py","function: helper_name"],"open_question":"optional unresolved gap"}}]}}
 ---END---
 
 For `execute`, `action_summary`, `review_goal`, and `references` are required.
+IMPORTANT: Include `value` in each reference so the action phase can use the gathered data directly without re-reading files or re-running commands.
 Keep every finding concise, concrete, and tied to exact references."""
 
     @staticmethod
@@ -918,6 +1173,8 @@ Keep every finding concise, concrete, and tied to exact references."""
             if not isinstance(item, dict):
                 continue
             finding = str(item.get("finding") or "").strip()
+            value = item.get("value")
+            source = str(item.get("source") or "").strip() or None
             refs_raw = item.get("references") or []
             references = (
                 [str(ref).strip() for ref in refs_raw if str(ref).strip()]
@@ -925,21 +1182,28 @@ Keep every finding concise, concrete, and tied to exact references."""
                 else ([str(refs_raw).strip()] if str(refs_raw).strip() else [])
             )
             open_question = str(item.get("open_question") or "").strip() or None
-            if not finding and not references and not open_question:
+            if not finding and not references and not open_question and value is None:
                 continue
-            normalized.append({
+            entry: dict[str, Any] = {
                 "finding": finding,
                 "references": references,
-                **({"open_question": open_question} if open_question else {}),
-            })
+            }
+            if value is not None:
+                entry["value"] = value
+            if source:
+                entry["source"] = source
+            if open_question:
+                entry["open_question"] = open_question
+            normalized.append(entry)
         return normalized
 
     @staticmethod
     def _planner_handoff_message(planned: _PlanDecision) -> str:
         """Build the planner handoff injected into action/review phases."""
         parts = [
-            "Internal planner handoff. This context was gathered with read-only investigation tools. "
-            "Use it to proceed without re-gathering the same context unless direct evidence requires it."
+            "Internal planner handoff. The following data was gathered with read-only investigation tools.",
+            "IMPORTANT: TRUST these values as ground truth. Use them directly without re-reading files or re-running commands. "
+            "Only gather new information if the task requires data NOT listed in the references below."
         ]
         if planned.action_summary:
             parts.append(f"Action Summary:\n{planned.action_summary}")
@@ -948,7 +1212,14 @@ Keep every finding concise, concrete, and tied to exact references."""
         if planned.references:
             rendered: list[str] = []
             for idx, item in enumerate(planned.references, start=1):
-                entry = [f"{idx}. Finding: {item.get('finding') or '(unspecified)'}"]
+                finding = item.get('finding') or '(unspecified)'
+                value = item.get('value')
+                source = item.get('source')
+                entry = [f"{idx}. {finding}"]
+                if value is not None:
+                    entry.append(f"   Value: {value}")
+                if source:
+                    entry.append(f"   Source: {source}")
                 refs = item.get("references") or []
                 if refs:
                     entry.append("   References:")
@@ -956,7 +1227,7 @@ Keep every finding concise, concrete, and tied to exact references."""
                 if item.get("open_question"):
                     entry.append(f"   Open Question: {item['open_question']}")
                 rendered.append("\n".join(entry))
-            parts.append("References:\n" + "\n".join(rendered))
+            parts.append("Gathered Context:\n" + "\n".join(rendered))
         return "\n\n".join(parts)
 
     @staticmethod
@@ -977,9 +1248,15 @@ Keep every finding concise, concrete, and tied to exact references."""
             lines: list[str] = []
             for idx, item in enumerate(planned.references, start=1):
                 finding = str(item.get("finding") or "").strip()
+                value = item.get("value")
+                source = item.get("source")
                 refs = item.get("references") or []
                 if finding:
                     lines.append(f"{idx}. {finding}")
+                if value is not None:
+                    lines.append(f"   - Value: {value}")
+                if source:
+                    lines.append(f"   - Source: {source}")
                 for ref in refs:
                     lines.append(f"   - {ref}")
                 if item.get("open_question"):
@@ -1112,6 +1389,13 @@ End your response with exactly:
             self._log_preview(goal, limit=140),
         )
         recent_messages = self._recent_legal_messages(messages, max_messages=12)
+        verifier_tools = self._build_read_only_tools()
+        # Strict providers (e.g. GitHub Copilot's OpenAI-compat proxy) return
+        # HTTP 400 when conversation history references tool names or tool_call
+        # ids the model wasn't told about. Collapse the prior action transcript
+        # into a single narrative user message so the verifier sees a clean,
+        # schema-safe context with at most one recent screenshot attached.
+        summarized = self._summarize_history_for_verifier(recent_messages)
         verify_messages = [
             {"role": "system", "content": self._verifier_prompt(goal)},
             {"role": "user", "content": (
@@ -1119,11 +1403,11 @@ End your response with exactly:
                 f"Goal:\n{goal}\n\n"
                 "Read any changed files or artifacts and verify the result."
             )},
-            *recent_messages,
+            *summarized,
         ]
         result = await self._run_agent(
             verify_messages,
-            tools=self._build_read_only_tools(),
+            tools=verifier_tools,
             max_iterations=10,
             channel=channel,
             chat_id=chat_id,
@@ -1247,6 +1531,7 @@ End your response with exactly:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         approval_granted: bool = False,
         planned: _PlanDecision | None = None,
+        skip_verification: bool = False,
     ) -> AgentRunResult:
         policy = RiskyActionPolicy(
             workspace=self.workspace,
@@ -1276,7 +1561,7 @@ End your response with exactly:
             logger.info("Action phase paused for approval on {}:{}", channel, chat_id)
             return result
 
-        if not self._should_verify(task_text, result.tools_used, planned):
+        if skip_verification or not self._should_verify(task_text, result.tools_used, planned):
             logger.info(
                 "Verification skipped for {}:{} tools_used={} planned_handoff={}",
                 channel,
@@ -1534,6 +1819,18 @@ End your response with exactly:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def cancel_active_tasks(self) -> None:
+        """Cancel all active message processing and background tasks."""
+        for tasks in self._active_tasks.values():
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        self._active_tasks.clear()
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+        self._background_tasks.clear()
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1541,6 +1838,8 @@ End your response with exactly:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        planning_mode_override: str | None = None,
+        skip_verification: bool = False,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1706,7 +2005,8 @@ End your response with exactly:
                 logger.error("Failed to check token count: {}", e)
 
         planned: _PlanDecision | None = None
-        if self._should_plan(current_message):
+        effective_planning_mode = planning_mode_override if planning_mode_override is not None else self.planning_mode
+        if self._should_plan_with_mode(current_message, effective_planning_mode):
             planned = await self._run_internal_planner(
                 initial_messages,
                 channel=msg.channel,
@@ -1781,6 +2081,7 @@ End your response with exactly:
             message_id=msg.metadata.get("message_id"),
             approval_granted=approval_note is not None,
             planned=planned,
+            skip_verification=skip_verification,
         )
         final_content = result.final_content
         all_msgs = result.messages
@@ -1963,9 +2264,11 @@ End your response with exactly:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        planning_mode: str | None = None,
+        skip_verification: bool = False,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -1973,4 +2276,6 @@ End your response with exactly:
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
+            planning_mode_override=planning_mode,
+            skip_verification=skip_verification,
         )

@@ -177,15 +177,25 @@ def _make_single_provider(config: Any, provider_name: str, model: str) -> Any:
             elif spec.default_api_base:
                 api_base = spec.default_api_base
 
+        token_provider = None
+        merged_headers = dict(p.extra_headers) if p and p.extra_headers else {}
+        if spec and spec.name == "github_copilot":
+            from nanobot.providers import copilot_auth
+
+            token_provider = copilot_auth.get_copilot_bearer
+            for k, v in copilot_auth.copilot_request_headers().items():
+                merged_headers.setdefault(k, v)
+
         return OpenAICompatProvider(
             api_key=primary_key,
             api_keys=keys if len(keys) > 1 else None,
             api_base=api_base,
             default_model=model,
-            extra_headers=p.extra_headers if p else None,
+            extra_headers=merged_headers or None,
             rate_limit=p.rate_limit if p else 0,
             timeout=p.timeout if p else 60.0,
             spec=spec,
+            token_provider=token_provider,
         )
 
 

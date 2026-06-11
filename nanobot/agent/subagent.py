@@ -17,6 +17,7 @@ from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
 from nanobot.agent.tools.agent_device import AgentDeviceTool
+from nanobot.agent.tools.desktop_use import DesktopUseTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.mcp import connect_mcp_servers, is_read_only_mcp_tool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -28,6 +29,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import (
     AgentBrowserConfig,
     AgentDeviceConfig,
+    DesktopUseConfig,
     ExecToolConfig,
     ImageConfig,
     WebSearchConfig,
@@ -244,6 +246,7 @@ class SubagentManager:
         web_proxy: str | None = None,
         agent_browser_config: "AgentBrowserConfig | None" = None,
         agent_device_config: "AgentDeviceConfig | None" = None,
+        desktop_use_config: "DesktopUseConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         image_config: "ImageConfig | None" = None,
         context_paths: list[Path] | None = None,
@@ -262,6 +265,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.agent_browser_config = agent_browser_config or AgentBrowserConfig()
         self.agent_device_config = agent_device_config or AgentDeviceConfig()
+        self.desktop_use_config = desktop_use_config or DesktopUseConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.image_config = image_config or ImageConfig()
         self.context_manager = context_manager or ContextRepoManager.from_config(context_paths=context_paths)
@@ -301,6 +305,28 @@ class SubagentManager:
         if not allowed_dir:
             return None
         return self.resource_policy.extra_write_dirs()
+
+    def _skills_loader(self) -> SkillsLoader:
+        return SkillsLoader(
+            self.workspace,
+            extra_paths=self._context_skill_paths() or None,
+        )
+
+    def _always_skills_section(self) -> str:
+        """Inline always-loaded skill bodies for subagent prompts.
+
+        Mirrors what ContextBuilder.build_system_prompt does for the main
+        agent so subagents (review, explore, generic) see the same skill
+        rules that the user opted into globally via ``always: true``.
+        """
+        loader = self._skills_loader()
+        always = loader.get_always_skills()
+        if not always:
+            return ""
+        body = loader.load_skills_for_context(always)
+        if not body:
+            return ""
+        return f"## Active Skills\n\n{body}"
 
     @staticmethod
     def _tool_error_detail(result: Any) -> str | None:
@@ -486,6 +512,17 @@ class SubagentManager:
     # Generation tools
     # ------------------------------------------------------------------
 
+    def _register_desktop_input_tools(self, tools: ToolRegistry) -> None:
+        """Register desktop_use on a tool registry if enabled."""
+        if self.desktop_use_config.enabled:
+            tools.register(DesktopUseTool(
+                screenshot_delay=self.desktop_use_config.screenshot_delay,
+                typing_delay_ms=self.desktop_use_config.typing_delay_ms,
+                scaling_enabled=self.desktop_use_config.scaling_enabled,
+                max_output_chars=self.desktop_use_config.max_output_chars,
+                working_dir=str(self.workspace),
+            ))
+
     def _build_generation_tools(
         self,
         *,
@@ -527,6 +564,7 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 resource_policy=self.resource_policy,
+                desktop_use_active=self.desktop_use_config.enabled,
             ))
         if self.agent_browser_config.enabled:
             tools.register(AgentBrowserTool(
@@ -540,6 +578,7 @@ class SubagentManager:
                 timeout=self.agent_device_config.timeout,
                 max_output_chars=self.agent_device_config.max_output_chars,
             ))
+        self._register_desktop_input_tools(tools)
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
         return tools
@@ -562,6 +601,7 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 resource_policy=self.resource_policy,
+                desktop_use_active=self.desktop_use_config.enabled,
             ))
         if self.agent_browser_config.enabled:
             tools.register(AgentBrowserTool(
@@ -575,6 +615,7 @@ class SubagentManager:
                 timeout=self.agent_device_config.timeout,
                 max_output_chars=self.agent_device_config.max_output_chars,
             ))
+        self._register_desktop_input_tools(tools)
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
         for tool in self._review_mcp_tools.iter_tools():
@@ -623,6 +664,7 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 resource_policy=self.resource_policy,
+                desktop_use_active=self.desktop_use_config.enabled,
             ))
         if self.agent_browser_config.enabled:
             tools.register(AgentBrowserTool(
@@ -636,6 +678,7 @@ class SubagentManager:
                 timeout=self.agent_device_config.timeout,
                 max_output_chars=self.agent_device_config.max_output_chars,
             ))
+        self._register_desktop_input_tools(tools)
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
         for tool in self._review_mcp_tools.iter_tools():
@@ -648,7 +691,7 @@ class SubagentManager:
         from nanobot.agent.context import ContextBuilder
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
-        return f"""# Explore Agent
+        sections = [f"""# Explore Agent
 
 {time_ctx}
 
@@ -661,16 +704,23 @@ You are nanobot's internal explore subagent. Your only job is to gather high-sig
 - When multiple independent checks are safe, call them in parallel.
 - Track concrete references as you go: files, functions, commands, URLs, assets, or timeline timestamps.
 - Do not write a plan. Return findings that help the planner decide what to do next.
+- If an active skill below suggests writing or mutating state, ignore that part — you are read-only.
 
 ## Thoroughness
-{thoroughness}
+{thoroughness}"""]
 
-## Output
+        always_section = self._always_skills_section()
+        if always_section:
+            sections.append(always_section)
+
+        sections.append("""## Output
 End your response with exactly:
 
 ---EXPLORE---
-{{"summary":"brief overview","findings":["finding 1"],"references":["file: /path/example.py"],"open_questions":["remaining gap"],"searched_areas":["what you inspected"],"partial":true_or_false}}
----END---"""
+{"summary":"brief overview","findings":["finding 1"],"references":["file: /path/example.py"],"open_questions":["remaining gap"],"searched_areas":["what you inspected"],"partial":true_or_false}
+---END---""")
+
+        return "\n\n".join(sections)
 
     @staticmethod
     def _parse_explore_result(result: str | None) -> dict[str, Any]:
@@ -769,7 +819,7 @@ End your response with exactly:
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
 
-        return f"""# Review Agent
+        sections = [f"""# Review Agent
 
 {time_ctx}
 
@@ -792,18 +842,25 @@ You are a review agent. Your job is to critically evaluate whether a generation 
 4. For video, timeline, or media-editing tasks, inspect the actual timeline/previews with read-only MCP tools when available.
 5. If a media-editing claim would require timeline/preview inspection and you cannot inspect it, do not approve the work.
 6. If the output is genuinely good and meets the goal, approve it. Do not reject good work unnecessarily.
+7. Verify with the same observable channel the generation agent used. When the work was performed via `desktop_use`, verify with `desktop_use` screenshots — do not bypass with shell escapes that the user can't see.
 
 ## Workspace
-{self.workspace}
+{self.workspace}"""]
 
-## Output Format
+        always_section = self._always_skills_section()
+        if always_section:
+            sections.append(always_section)
+
+        sections.append("""## Output Format
 You MUST end your final response with exactly this JSON block:
 
 ---REVIEW---
-{{"approved": true_or_false, "confidence": 0_to_100, "issues": ["issue1", "issue2"], "feedback": "Detailed actionable feedback for the generation agent"}}
+{"approved": true_or_false, "confidence": 0_to_100, "issues": ["issue1", "issue2"], "feedback": "Detailed actionable feedback for the generation agent"}
 ---END---
 
-If approved, set feedback to a brief confirmation. If not approved, feedback MUST contain specific, actionable instructions for what to fix."""
+If approved, set feedback to a brief confirmation. If not approved, feedback MUST contain specific, actionable instructions for what to fix.""")
+
+        return "\n\n".join(sections)
 
     @staticmethod
     def _parse_review(result: str) -> dict[str, Any]:
@@ -1111,6 +1168,10 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
                 f"{self.context_manager.prompt_summary()}\n\n"
                 "Context repository skills, modules, and store contracts supplement the workspace skills for this subagent."
             )
+
+        always_section = self._always_skills_section()
+        if always_section:
+            parts.append(always_section)
 
         skills_summary = SkillsLoader(
             self.workspace,

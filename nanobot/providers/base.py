@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -186,6 +187,22 @@ class LLMProvider(ABC):
                         changed = True
                     else:
                         new_items.append(item)
+                # Ensure content lists with image_url blocks also have a text
+                # block.  Some providers (e.g. Xiaomi) reject requests where
+                # image_url appears without a companion text block, raising
+                # "text is not set".
+                has_image = any(
+                    isinstance(b, dict) and b.get("type") == "image_url"
+                    for b in new_items
+                )
+                has_text = any(
+                    isinstance(b, dict)
+                    and b.get("type") in ("text", "input_text", "output_text")
+                    for b in new_items
+                )
+                if has_image and not has_text:
+                    new_items.insert(0, {"type": "text", "text": ""})
+                    changed = True
                 if changed:
                     clean = dict(msg)
                     if new_items:
@@ -368,9 +385,62 @@ class LLMProvider(ABC):
             pass
         return None
 
+    # Markers that indicate the provider/proxy rejected the request because the
+    # payload was too large, rather than because the model lacks vision support.
+    _PAYLOAD_TOO_LARGE_MARKERS = (
+        "request entity too large",
+        "payload too large",
+        "413",
+        "request body too large",
+        "content too large",
+        "max request size",
+    )
+
+    # How many of the most-recent image_url blocks to retain in conversation
+    # history before sending to the provider. Older images are replaced with a
+    # text placeholder to keep the wire payload under typical proxy limits
+    # (e.g. GitHub Copilot's OpenAI-compatible endpoint rejects payloads above
+    # a few MB). Set to a higher value if your provider tolerates large
+    # multi-image requests, or 0 to keep all images.
+    _DEFAULT_IMAGE_HISTORY_KEEP = 1
+    try:
+        _IMAGE_HISTORY_KEEP = int(
+            os.environ.get("NANOBOT_IMAGE_HISTORY_KEEP", _DEFAULT_IMAGE_HISTORY_KEEP)
+        )
+        if _IMAGE_HISTORY_KEEP < 0:
+            _IMAGE_HISTORY_KEEP = _DEFAULT_IMAGE_HISTORY_KEEP
+    except (TypeError, ValueError):
+        _IMAGE_HISTORY_KEEP = _DEFAULT_IMAGE_HISTORY_KEEP
+
+    @classmethod
+    def _is_payload_too_large(cls, content: str | None) -> bool:
+        err = (content or "").lower()
+        return any(marker in err for marker in cls._PAYLOAD_TOO_LARGE_MARKERS)
+
     @staticmethod
-    def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-        """Replace image_url blocks with text placeholder. Returns None if no images found."""
+    def _strip_image_content(
+        messages: list[dict[str, Any]],
+        *,
+        reason: str = "vision",
+    ) -> list[dict[str, Any]] | None:
+        """Replace image_url blocks with an explicit warning. Returns None if no images found.
+
+        ``reason`` controls the warning text injected so the model knows why it
+        cannot see the image and must not fabricate visual verification.
+        """
+        if reason == "payload_too_large":
+            note = (
+                "[IMAGE DROPPED — payload exceeded provider/proxy size limit. "
+                "You did NOT see this image. Do not claim visual verification; "
+                "ask for a smaller capture or use a non-visual confirmation path.]"
+            )
+        else:
+            note = (
+                "[IMAGE DROPPED — the active model/provider rejected image content. "
+                "You did NOT see this image. Do not claim visual verification; "
+                "switch to a vision-capable model or use a non-visual confirmation path.]"
+            )
+
         found = False
         result = []
         for msg in messages:
@@ -380,7 +450,7 @@ class LLMProvider(ABC):
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "image_url":
                         path = (b.get("_meta") or {}).get("path", "")
-                        placeholder = f"[image: {path}]" if path else "[image omitted]"
+                        placeholder = f"{note} (path={path})" if path else note
                         new_content.append({"type": "text", "text": placeholder})
                         found = True
                     else:
@@ -389,6 +459,80 @@ class LLMProvider(ABC):
             else:
                 result.append(msg)
         return result if found else None
+
+    @classmethod
+    def _prune_old_images(
+        cls,
+        messages: list[dict[str, Any]],
+        keep: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Keep only the most recent ``keep`` image_url blocks; replace older ones with text.
+
+        Walks messages newest-first, counts ``image_url`` blocks, and replaces
+        any beyond the keep-budget with a short placeholder so the agent can
+        still see *that* an earlier screenshot existed (and find it on disk via
+        the original ``_meta.path``). This prevents per-turn payload growth
+        when an agent takes many screenshots in a row.
+
+        Returns a new list if anything was pruned, otherwise the original list
+        unchanged (caller can safely reuse).
+        """
+        budget = cls._IMAGE_HISTORY_KEEP if keep is None else keep
+        if budget < 0 or not messages:
+            return messages
+
+        # First pass: count total image_url blocks.
+        total = 0
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "image_url":
+                        total += 1
+        if total <= budget:
+            return messages
+
+        to_drop = total - budget  # number of *oldest* images to replace
+        if to_drop <= 0:
+            return messages
+
+        dropped = 0
+        new_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                new_messages.append(msg)
+                continue
+            changed = False
+            new_content: list[Any] = []
+            for b in content:
+                if (
+                    dropped < to_drop
+                    and isinstance(b, dict)
+                    and b.get("type") == "image_url"
+                ):
+                    path = (b.get("_meta") or {}).get("path", "")
+                    if path:
+                        placeholder = (
+                            f"[earlier screenshot omitted from history — only the "
+                            f"{budget} most recent image(s) are retained. "
+                            f"Original path: {path}. Re-capture if you need to see it again.]"
+                        )
+                    else:
+                        placeholder = (
+                            f"[earlier screenshot omitted from history — only the "
+                            f"{budget} most recent image(s) are retained.]"
+                        )
+                    new_content.append({"type": "text", "text": placeholder})
+                    dropped += 1
+                    changed = True
+                else:
+                    new_content.append(b)
+            if changed:
+                new_messages.append({**msg, "content": new_content})
+            else:
+                new_messages.append(msg)
+        return new_messages
 
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
@@ -454,6 +598,11 @@ class LLMProvider(ABC):
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
 
+        # Sliding window: drop all but the most recent N images from history
+        # before sending. Prevents per-turn payload growth from accumulated
+        # screenshots blowing past provider/proxy size limits.
+        messages = self._prune_old_images(messages)
+
         delivered_any = False
         effective_delta = on_content_delta
         if on_content_delta is not None:
@@ -483,9 +632,29 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_response(response):
-                stripped = self._strip_image_content(messages)
+                too_large = self._is_payload_too_large(response.content)
+                strip_reason = "payload_too_large" if too_large else "vision"
+                stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    if too_large:
+                        logger.error(
+                            "Provider {} (model={}) rejected request: payload too large. "
+                            "The image is being stripped and the agent will be told it cannot "
+                            "see it. Reduce screenshot resolution / inline-byte cap, or send "
+                            "fewer prior images. Original error: {}",
+                            type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                            (response.content or "")[:300],
+                        )
+                    else:
+                        logger.error(
+                            "Provider {} (model={}) rejected request containing image content. "
+                            "This usually means the provider/model does not accept vision input, "
+                            "or the request shape is wrong. Original error: {}. "
+                            "Retrying once with images stripped so the agent can proceed; "
+                            "switch to a vision-capable model to enable screenshots.",
+                            type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                            (response.content or "")[:300],
+                        )
                     return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
@@ -523,6 +692,9 @@ class LLMProvider(ABC):
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
 
+        # Sliding window: drop all but the most recent N images from history.
+        messages = self._prune_old_images(messages)
+
         kw: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
@@ -536,9 +708,29 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_response(response):
-                stripped = self._strip_image_content(messages)
+                too_large = self._is_payload_too_large(response.content)
+                strip_reason = "payload_too_large" if too_large else "vision"
+                stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    if too_large:
+                        logger.error(
+                            "Provider {} (model={}) rejected request: payload too large. "
+                            "The image is being stripped and the agent will be told it cannot "
+                            "see it. Reduce screenshot resolution / inline-byte cap, or send "
+                            "fewer prior images. Original error: {}",
+                            type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                            (response.content or "")[:300],
+                        )
+                    else:
+                        logger.error(
+                            "Provider {} (model={}) rejected request containing image content. "
+                            "This usually means the provider/model does not accept vision input, "
+                            "or the request shape is wrong. Original error: {}. "
+                            "Retrying once with images stripped so the agent can proceed; "
+                            "switch to a vision-capable model to enable screenshots.",
+                            type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                            (response.content or "")[:300],
+                        )
                     return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 

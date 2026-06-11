@@ -51,6 +51,12 @@ class ProviderSpec:
     strip_model_prefix: bool = False  # strip "provider/" before sending to gateway
     supports_max_completion_tokens: bool = False
 
+    # Route reasoning-model requests through the OpenAI Responses API
+    # (/v1/responses) instead of /v1/chat/completions. Required for providers
+    # (e.g. GitHub Copilot) whose chat-completions endpoint rejects
+    # reasoning_effort when function tools are attached.
+    use_responses_api: bool = False
+
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
@@ -233,6 +239,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://api.githubcopilot.com",
         is_oauth=True,
+        strip_model_prefix=True,
+        use_responses_api=True,
     ),
     # DeepSeek: OpenAI-compatible at api.deepseek.com
     ProviderSpec(

@@ -269,11 +269,67 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
 
         if role == "tool":
             call_id, _ = _normalize_tool_call_ref(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            text_parts, image_urls = _split_tool_content(content)
+            output_text = text_parts if text_parts else ""
             input_items.append({"type": "function_call_output", "call_id": call_id, "output": output_text})
+            # The Codex Responses API has no field for image output on
+            # function_call_output, so re-attach any tool-returned image(s)
+            # as a synthetic user message with input_image parts so the
+            # model can actually see them (e.g. desktop_use screenshots).
+            if image_urls:
+                tool_name = msg.get("name") or ""
+                parts: list[dict[str, Any]] = [{
+                    "type": "input_text",
+                    "text": f"[tool {tool_name} returned the following image(s)]".strip(),
+                }]
+                for url in image_urls:
+                    parts.append({"type": "input_image", "image_url": url, "detail": "auto"})
+                input_items.append({"role": "user", "content": parts})
 
     system_prompt = "\n\n".join(system_parts)
     return system_prompt, input_items
+
+
+def _split_tool_content(content: Any) -> tuple[str, list[str]]:
+    """Split a tool message's content into (text_output, image_urls).
+
+    Mirrors the OpenAI-compat provider's behavior: image_url blocks are
+    extracted and returned separately so they can be re-attached as an
+    `input_image` synthetic user message, instead of being JSON-dumped
+    into the function_call_output text (which is invisible to vision).
+    """
+    if content is None:
+        return "", []
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        image_urls: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t == "image_url":
+                    iu = item.get("image_url")
+                    url = iu if isinstance(iu, str) else (iu or {}).get("url") if isinstance(iu, dict) else None
+                    if isinstance(url, str) and url:
+                        image_urls.append(url)
+                    continue
+                if t == "input_image":
+                    iu = item.get("image_url")
+                    if isinstance(iu, str) and iu:
+                        image_urls.append(iu)
+                    continue
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+                    continue
+                text_parts.append(json.dumps(item, ensure_ascii=False))
+            elif isinstance(item, str):
+                text_parts.append(item)
+            else:
+                text_parts.append(str(item))
+        return "".join(text_parts), image_urls
+    return json.dumps(content, ensure_ascii=False), []
 
 
 def _convert_user_message(content: Any) -> dict[str, Any]:

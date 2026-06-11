@@ -273,6 +273,7 @@ nanobot channels login whatsapp
 > For web search capability setup, please see [Web Search](#web-search).
 > Optional browser automation tool: `agent_browser` is not installed by Nanobot's Python install, including `pip install -e .` and `pip install nanobot-ai`. Install Node.js/npm first, then install or run `agent-browser` separately via `npx`.
 > Optional mobile device automation tool: `agent_device` is not installed by Nanobot's Python install, including `pip install -e .` and `pip install nanobot-ai`. Install Node.js/npm first, then install or run `agent-device` separately via `npx`.
+> Optional desktop automation tool: `desktop_use` is disabled by default and requires macOS with PyObjC (`pip install 'nanobot-ai[desktop]'`) plus OS Accessibility/Screen-Recording permissions. Enable it via `tools.desktop_use.enabled: true` in your config.
 
 **1. Initialize**
 
@@ -339,6 +340,37 @@ Notes:
 - `agent-device` requires Node.js 22+, Xcode tooling for iOS simulator control, and Android SDK/ADB for Android emulator control.
 - If Node.js/npm is installed, `npx --yes agent-device ...` can fetch the package on demand, but global install is more predictable for local QA machines.
 - The built-in Nanobot integration is focused on opening apps, taking snapshots and screenshots, tapping, typing, and validating UI state on local emulators.
+
+**Optional: Desktop Use (Desktop Automation) Setup**
+
+Nanobot includes `desktop_use`, a stateless pixel-coordinate desktop driver modeled after Anthropic's `computer-use-demo` and OpenAI's Operator. It gives the agent the ability to drive the host desktop (screenshots, clicks, typing, scrolling) using raw pixel coordinates — no daemon, no AX tree, no external CLI. It is **disabled by default** because it can act on anything visible on your screen.
+
+Install prerequisites:
+
+```bash
+# Install nanobot with the desktop extra (macOS only)
+pip install 'nanobot-ai[desktop]'
+```
+
+On macOS, grant **Accessibility** (for clicks/typing) and **Screen Recording** (for screenshots) permissions in System Settings → Privacy & Security. `desktop_use` is macOS-only for now; inside Docker / headless Linux servers, it is not usable — leave it disabled.
+
+Enable it in your config:
+
+```yaml
+tools:
+  desktop_use:
+    enabled: true
+    # screenshot_delay: 0.5    # delay before capturing screenshot
+    # typing_delay_ms: 12      # delay between keystrokes
+    # scaling_enabled: true    # downscale to vision-model-friendly resolution
+    # max_output_chars: 12000  # cap on text output length
+```
+
+Notes:
+
+- `desktop_use` requires macOS with PyObjC. It is not baked into the Docker image; it must run on the host with a real desktop session.
+- The tool is stateless — every call is a one-shot OS event. The agent sees a screenshot, reasons on the image, then issues pixel-coordinate actions.
+- See `nanobot/skills/desktop-use/SKILL.md` for the preferred screenshot → reason → act → verify loop.
 
 **2. Configure** (`~/.nanobot/config.json`)
 

@@ -431,15 +431,25 @@ def _make_single_provider(config: Config, provider_name: str, model: str):
 
     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
+    token_provider = None
+    merged_headers = dict(p.extra_headers) if p and p.extra_headers else {}
+    if spec and spec.name == "github_copilot":
+        from nanobot.providers import copilot_auth
+
+        token_provider = copilot_auth.get_copilot_bearer
+        for k, v in copilot_auth.copilot_request_headers().items():
+            merged_headers.setdefault(k, v)
+
     return OpenAICompatProvider(
         api_key=primary_key,
         api_keys=keys if len(keys) > 1 else None,
         api_base=config.get_api_base(model),
         default_model=model,
-        extra_headers=p.extra_headers if p else None,
+        extra_headers=merged_headers or None,
         rate_limit=p.rate_limit if p else 0,
         timeout=p.timeout if p else 60.0,
         spec=spec,
+        token_provider=token_provider,
     )
 
 
@@ -652,6 +662,7 @@ def gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     log_file: str | None = typer.Option(None, "--log-file", help="Write logs to this file (rotated at 20 MB, 7 days kept)"),
+    no_cron: bool = typer.Option(False, "--no-cron", help="Disable cron jobs on this run"),
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
@@ -711,6 +722,7 @@ def gateway(
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
         agent_device_config=config.tools.agent_device,
+        desktop_use_config=config.tools.desktop_use,
         exec_config=config.tools.exec,
         image_config=config.tools.image,
         cron_service=cron,
@@ -764,6 +776,8 @@ def gateway(
                     session_key=f"cron:{job.id}",
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to or "direct",
+                    planning_mode=job.payload.planning_mode,
+                    skip_verification=job.payload.skip_verification,
                 )
             except Exception as exc:
                 agent.record_task_failure(
@@ -886,7 +900,8 @@ def gateway(
 
     async def run():
         try:
-            await cron.start()
+            if not no_cron:
+                await cron.start()
             await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
@@ -899,13 +914,74 @@ def gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            await agent.close_mcp()
-            heartbeat.stop()
             cron.stop()
+            heartbeat.stop()
             agent.stop()
+            agent.cancel_active_tasks()
+            await agent.close_mcp()
             await channels.stop_all()
 
     asyncio.run(run())
+
+
+@app.command("cron")
+def cron_cmd(
+    action: str = typer.Argument(..., help="Action: list, enable, disable"),
+    job_id: str = typer.Option(None, "--job", "-j", help="Job ID (for enable/disable)"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Manage cron jobs (list, enable, disable)."""
+    from nanobot.cron.service import CronService
+
+    cfg = _load_runtime_config(config, workspace)
+    store_path = cfg.workspace_path / "cron" / "jobs.json"
+    if not store_path.exists():
+        console.print("[yellow]No cron jobs found.[/yellow]")
+        raise typer.Exit()
+
+    svc = CronService(store_path)
+
+    if action == "list":
+        jobs = svc.list_jobs(include_disabled=True)
+        if not jobs:
+            console.print("[yellow]No cron jobs.[/yellow]")
+            return
+        for j in jobs:
+            status = "[green]enabled[/green]" if j.enabled else "[dim]disabled[/dim]"
+            sched = j.schedule
+            if sched.kind == "every":
+                desc = f"every {sched.every_ms // 1000}s"
+            elif sched.kind == "cron":
+                desc = f"cron: {sched.expr}"
+            elif sched.kind == "at":
+                desc = f"at: {sched.at_ms}"
+            else:
+                desc = str(sched)
+            console.print(f"  {j.id}  {status}  {j.name}  ({desc})")
+    elif action == "enable":
+        if not job_id:
+            console.print("[red]--job is required for enable[/red]")
+            raise typer.Exit(1)
+        job = svc.enable_job(job_id, enabled=True)
+        if job:
+            console.print(f"[green]Enabled {job.name}[/green]")
+        else:
+            console.print(f"[red]Job {job_id} not found[/red]")
+            raise typer.Exit(1)
+    elif action == "disable":
+        if not job_id:
+            console.print("[red]--job is required for disable[/red]")
+            raise typer.Exit(1)
+        job = svc.enable_job(job_id, enabled=False)
+        if job:
+            console.print(f"[yellow]Disabled {job.name}[/yellow]")
+        else:
+            console.print(f"[red]Job {job_id} not found[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print(f"[red]Unknown action: {action}. Use list, enable, or disable.[/red]")
+        raise typer.Exit(1)
 
 
 
@@ -973,6 +1049,7 @@ def agent(
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
         agent_device_config=config.tools.agent_device,
+        desktop_use_config=config.tools.desktop_use,
         exec_config=config.tools.exec,
         image_config=config.tools.image,
         cron_service=cron,
@@ -1512,28 +1589,26 @@ def _login_openai_codex() -> None:
 
 @_register_login("github_copilot")
 def _login_github_copilot() -> None:
-    import asyncio
-
-    from openai import AsyncOpenAI
+    from nanobot.providers import copilot_auth
 
     console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
 
-    async def _trigger():
-        client = AsyncOpenAI(
-            api_key="dummy",
-            base_url="https://api.githubcopilot.com",
-        )
-        await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
+    def _show(user_code: str, verification_uri: str) -> None:
+        console.print(f"  1. Open: [link]{verification_uri}[/link]")
+        console.print(f"  2. Enter code: [bold yellow]{user_code}[/bold yellow]\n")
+        console.print("[dim]Waiting for approval... (Ctrl-C to cancel)[/dim]\n")
 
     try:
-        asyncio.run(_trigger())
+        copilot_auth.device_login(on_user_code=_show)
         console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
-    except Exception as e:
-        console.print(f"[red]Authentication error: {e}[/red]")
+        console.print(
+            f"[dim]Credentials saved to {copilot_auth._auth_path()}[/dim]"
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Login cancelled[/yellow]")
+        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"[red]Authentication error: {exc}[/red]")
         raise typer.Exit(1)
 
 

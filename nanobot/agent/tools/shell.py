@@ -24,9 +24,14 @@ class ExecTool(Tool):
         restrict_to_workspace: bool = False,
         path_append: str = "",
         resource_policy: Any | None = None,
+        desktop_use_active: bool = False,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
+        # When desktop_use is enabled the exec description warns against
+        # invisible shell escapes for desktop state (osascript, lsappinfo,
+        # AppleScript, ...).
+        self.desktop_use_active = bool(desktop_use_active)
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -53,7 +58,16 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        base = "Execute a shell command and return its output. Use with caution."
+        if self.desktop_use_active:
+            return (
+                base
+                + " desktop_use is enabled, so DO NOT use this shell to inspect or change "
+                "desktop/window/app state \u2014 no `osascript`, `AppleScript`, `open -a`, "
+                "`lsappinfo`, `wmctrl`, `xdotool`, or similar. Route any UI/desktop/window "
+                "action or check through the `desktop_use` tool (screenshot + pixel coords) instead."
+            )
+        return base
 
     @property
     def parameters(self) -> dict[str, Any]:

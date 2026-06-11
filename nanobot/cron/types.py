@@ -27,6 +27,9 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # Per-job overrides for the agent loop
+    planning_mode: Literal["on", "off", "agent"] | None = None  # None = use global default
+    skip_verification: bool = False
 
 
 @dataclass

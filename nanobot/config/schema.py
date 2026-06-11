@@ -203,6 +203,27 @@ class AgentDeviceConfig(Base):
     max_output_chars: int = 12000
 
 
+class DesktopUseConfig(Base):
+    """Desktop-use tool configuration (pure-Python, stateless).
+
+    Stateless desktop driver: no daemon, no AX tree. Each call is a
+    one-shot OS-level event (CGEvent on macOS). The model works from
+    screenshots + pixel coordinates, like Anthropic's ``computer-use-demo``
+    and OpenAI's Operator agent.
+
+    Disabled by default. macOS requires the PyObjC frameworks
+    (``pip install 'nanobot-ai[desktop]'``) plus Accessibility and Screen
+    Recording permissions in System Settings > Privacy & Security.
+    Windows / Linux backends are not yet implemented.
+    """
+
+    enabled: bool = False
+    screenshot_delay: float = 0.5  # seconds to wait before capturing (let UI settle)
+    typing_delay_ms: int = 12  # per-character delay during `type`
+    scaling_enabled: bool = True  # downscale coords to XGA/WXGA/FWXGA
+    max_output_chars: int = 12000
+
+
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
@@ -240,6 +261,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     agent_browser: AgentBrowserConfig = Field(default_factory=AgentBrowserConfig)
     agent_device: AgentDeviceConfig = Field(default_factory=AgentDeviceConfig)
+    desktop_use: DesktopUseConfig = Field(default_factory=DesktopUseConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     image: ImageConfig = Field(default_factory=ImageConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory

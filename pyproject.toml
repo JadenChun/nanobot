@@ -70,6 +70,12 @@ matrix = [
 discord = [
     "discord.py>=2.5.2,<3.0.0",
 ]
+desktop = [
+    # macOS-only: PyObjC frameworks needed by the desktop_use tool.
+    # Installs are no-ops on non-Darwin systems (pyobjc wheels are mac-specific).
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+]
 langsmith = [
     "langsmith>=0.1.0",
 ]
