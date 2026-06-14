@@ -442,7 +442,9 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
     "telegram": {
       "enabled": true,
       "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
+      "allowFrom": ["YOUR_USER_ID"],
+      "allowChats": ["YOUR_GROUP_CHAT_ID"],
+      "groupPolicy": "mention"
     }
   }
 }
@@ -450,6 +452,10 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 
 > You can find your **User ID** in Telegram settings. It is shown as `@yourUserId`.
 > Copy this value **without the `@` symbol** and paste it into the config file.
+>
+> `allowChats` optionally restricts group and supergroup access by chat ID.
+> Private chats are still controlled by `allowFrom`. `groupPolicy` defaults to
+> `"mention"` and accepts mentions, replies to the bot, and slash commands.
 
 
 **3. Run**
@@ -1569,6 +1575,7 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `tools.agentBrowser.enabled` | `true` | Enable the built-in `agent_browser` tool (wrapper around `agent-browser` via `npx`). Requires a separate `agent-browser` setup with Node.js/npm, plus `agent-browser install` for browser binaries. |
 | `tools.agentDevice.enabled` | `true` | Enable the built-in `agent_device` tool (wrapper around `agent-device` via `npx`). Current built-in Nanobot guidance targets local iOS simulators and Android emulators and assumes local platform tooling is already installed. |
 | `channels.*.allowFrom` | `[]` (deny all) | Whitelist of user IDs. Empty denies all; use `["*"]` to allow everyone. |
+| `channels.telegram.allowChats` | `[]` (no group restriction) | Optional whitelist of Telegram group/supergroup chat IDs. Private chats remain controlled by `allowFrom`. |
 
 
 ### Timezone

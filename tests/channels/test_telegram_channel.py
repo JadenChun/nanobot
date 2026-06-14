@@ -1,5 +1,3 @@
-import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,8 +11,12 @@ except ImportError:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
-from nanobot.channels.telegram import TelegramConfig
+from nanobot.channels.telegram import (
+    TELEGRAM_REPLY_CONTEXT_MAX_LEN,
+    TelegramChannel,
+    TelegramConfig,
+    _StreamBuf,
+)
 
 
 class _FakeHTTPXRequest:
@@ -190,6 +192,11 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert builder.request_value is api_req
     assert builder.get_updates_request_value is poll_req
     assert any(cmd.command == "status" for cmd in app.bot.commands)
+    assert any(
+        getattr(handler, "callback", None) == channel._forward_command
+        and handler.__class__.__name__ == "MessageHandler"
+        for handler in app.handlers
+    )
 
 
 @pytest.mark.asyncio
@@ -498,6 +505,23 @@ def test_telegram_group_policy_defaults_to_mention() -> None:
     assert TelegramConfig().group_policy == "mention"
 
 
+def test_telegram_config_accepts_camel_case_allow_chats() -> None:
+    config = TelegramConfig.model_validate({"allowChats": ["-100123"]})
+
+    assert config.allow_chats == ["-100123"]
+
+
+def test_chat_allowlist_only_restricts_non_private_chats() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(allow_from=["*"], allow_chats=["-100123"]),
+        MessageBus(),
+    )
+
+    assert channel.is_chat_allowed("-100123", "supergroup") is True
+    assert channel.is_chat_allowed("-100999", "group") is False
+    assert channel.is_chat_allowed("12345", "private") is True
+
+
 def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     channel = TelegramChannel(TelegramConfig(allow_from=["12345", "alice", "67890|bob"]), MessageBus())
 
@@ -653,6 +677,62 @@ async def test_group_policy_mention_ignores_unmentioned_group_message() -> None:
 
     assert handled == []
     assert channel._app.bot.get_me_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_group_chat_allowlist_rejects_unapproved_group_before_policy_check() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            allow_chats=["-100999"],
+            group_policy="open",
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    await channel._on_message(_make_telegram_update(text="hello group"), None)
+
+    assert handled == []
+    assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_private_chat_is_allowed_when_group_allowlist_is_configured() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["12345"],
+            allow_chats=["-100999"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+    channel._add_reaction = AsyncMock()
+
+    await channel._on_message(
+        _make_telegram_update(text="hello privately", chat_type="private"),
+        None,
+    )
+
+    assert len(handled) == 1
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1129,30 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/new"
+
+
+@pytest.mark.asyncio
+async def test_forward_command_rejects_unapproved_group_chat() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            allow_chats=["-100999"],
+            group_policy="open",
+        ),
+        MessageBus(),
+    )
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    await channel._forward_command(_make_telegram_update(text="/weekly_review"), None)
+
+    assert handled == []
 
 
 @pytest.mark.asyncio
