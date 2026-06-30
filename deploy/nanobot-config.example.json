@@ -36,7 +36,7 @@
         "/connection_status": ["python3", "scripts/check_social_connection.py"],
         "/connect_meta": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "meta"],
         "/connect_tiktok": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "tiktok"],
-        "/sync_meta_analytics": ["python3", "scripts/fetch_meta_metrics.py", "--limit", "25"]
+        "/sync_meta_analytics": ["python3", "tools/meta_analytics.py", "sync", "--mode", "daily"]
       }
     }
   },
