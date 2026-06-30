@@ -13,9 +13,9 @@ def test_nanobot_systemd_service_uses_context_repo_and_secrets() -> None:
     assert "User=marketing-agent" in service
     assert "WorkingDirectory=/opt/marketing-agent/client-marketing-assistance" in service
     assert "EnvironmentFile=/opt/marketing-agent/secrets/nanobot.env" in service
-    assert "--config /opt/marketing-agent/secrets/nanobot-config.json" in service
+    assert "--config /opt/marketing-agent/.nanobot/config.json" in service
     assert "--log-file /opt/marketing-agent/logs/nanobot-gateway.log" in service
-    assert "ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs" in service
+    assert "ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs /opt/marketing-agent/.cache /opt/marketing-agent/.codex /opt/marketing-agent/.local" in service
 
 
 def test_nanobot_config_example_attaches_marketing_context_repo() -> None:
@@ -25,6 +25,8 @@ def test_nanobot_config_example_attaches_marketing_context_repo() -> None:
     assert '"contextRepos"' in config
     assert '"telegram"' in config
     assert '"enabled": true' in config
+    assert '"fastCommands"' in config
+    assert '"/connection_status"' in config
 
 
 def test_nanobot_deploy_script_supports_checkout_as_install_directory() -> None:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import subprocess
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -180,6 +182,9 @@ class TelegramConfig(Base):
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
+    fast_commands: dict[str, list[str]] = Field(default_factory=dict)
+    fast_command_workdir: str = ""
+    fast_command_timeout: int = 120
 
 
 class TelegramChannel(BaseChannel):
@@ -894,6 +899,60 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    @staticmethod
+    def _normalize_command(text: str | None) -> str:
+        """Return a normalized slash command such as /status or /cmd."""
+        if not text:
+            return ""
+        head = text.strip().split(maxsplit=1)[0]
+        if not head.startswith("/"):
+            return ""
+        return "/" + head[1:].split("@", 1)[0].lower()
+
+    async def _try_fast_command(self, message) -> bool:
+        """Run configured exact slash-command shortcuts without invoking the agent."""
+        command_name = self._normalize_command(getattr(message, "text", None))
+        command = self.config.fast_commands.get(command_name)
+        if not command:
+            return False
+        if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+            logger.warning("Ignoring invalid fast command config for {}", command_name)
+            return False
+
+        logger.info("Running Telegram fast command {}", command_name)
+        result = await asyncio.to_thread(
+            subprocess.run,
+            command,
+            cwd=self.config.fast_command_workdir or None,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=self.config.fast_command_timeout,
+            check=False,
+        )
+        output = (result.stdout or "").strip()
+        error_output = (result.stderr or "").strip()
+        if result.returncode != 0:
+            output = error_output or output or f"{command_name} failed with exit code {result.returncode}."
+        elif error_output:
+            logger.debug("Fast command {} stderr: {}", command_name, error_output[:500])
+        if not output:
+            output = f"{command_name} completed."
+
+        reply_params = None
+        if self.config.reply_to_message:
+            reply_params = ReplyParameters(
+                message_id=message.message_id,
+                allow_sending_without_reply=True,
+            )
+        thread_kwargs = {}
+        message_thread_id = getattr(message, "message_thread_id", None)
+        if message_thread_id is not None:
+            thread_kwargs["message_thread_id"] = message_thread_id
+        for chunk in split_message(output, TELEGRAM_MAX_MESSAGE_LEN):
+            await self._send_text(int(message.chat_id), chunk, reply_params, thread_kwargs)
+        return True
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
@@ -903,6 +962,8 @@ class TelegramChannel(BaseChannel):
         if not self._is_update_allowed(message, user):
             return
         self._remember_thread_context(message)
+        if await self._try_fast_command(message):
+            return
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),

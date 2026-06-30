@@ -7,12 +7,14 @@ Expected paths:
 ```text
 /opt/marketing-agent/nanobot-custom
 /opt/marketing-agent/client-marketing-assistance
-/opt/marketing-agent/secrets/nanobot-config.json
+/opt/marketing-agent/.nanobot/config.json
 /opt/marketing-agent/secrets/nanobot.env
 ```
 
-The secret files should be owned by `root:marketing-agent` with mode `0640` so
-systemd and the `marketing-agent` service user can read them.
+`nanobot.env` should be owned by `root:marketing-agent` with mode `0640` so
+systemd and the `marketing-agent` service user can read it. The Nanobot config
+lives under `.nanobot` because Nanobot derives runtime directories from the
+config file parent and needs to write cron, media, and credential state there.
 
 `nanobot-config.json` attaches the context repo through:
 
@@ -35,18 +37,23 @@ Clone the Nanobot repo into `/opt/marketing-agent/nanobot-custom`, then run:
 
 ```bash
 sudo bash /opt/marketing-agent/nanobot-custom/deploy/scripts/update_nanobot_gateway.sh
-sudoedit /opt/marketing-agent/secrets/nanobot-config.json
+sudoedit /opt/marketing-agent/.nanobot/config.json
 sudoedit /opt/marketing-agent/secrets/nanobot.env
 sudo systemctl enable --now nanobot-gateway
 ```
 
 Required values:
 
-- Telegram bot token in `nanobot-config.json`.
-- Telegram `allowFrom` or `allowChats` in `nanobot-config.json`.
-- Provider API key in `nanobot-config.json`, or through `NANOBOT_*` env vars.
+- Telegram bot token in `/opt/marketing-agent/.nanobot/config.json`.
+- Telegram `allowFrom` or `allowChats` in `/opt/marketing-agent/.nanobot/config.json`.
+- Provider API key in `/opt/marketing-agent/.nanobot/config.json`, or through `NANOBOT_*` env vars.
 - `OAUTH_BROKER_INTERNAL_API_KEY` in `nanobot.env`; it must match the OAuth
   broker's internal API key.
+
+For low-latency marketing operations, the example config maps common Telegram
+slash commands such as `/connection_status` and `/sync_meta_analytics` directly
+to context-repo scripts. Commands not listed in `fastCommands` still go through
+the normal agent loop.
 
 ## Updates
 

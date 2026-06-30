@@ -1156,6 +1156,45 @@ async def test_forward_command_rejects_unapproved_group_chat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_command_runs_configured_fast_command(monkeypatch) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            fast_commands={"/connection_status": ["python3", "scripts/check_social_connection.py"]},
+            fast_command_workdir="/workspace",
+            fast_command_timeout=15,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    def fake_run(command, **kwargs):
+        assert command == ["python3", "scripts/check_social_connection.py"]
+        assert kwargs["cwd"] == "/workspace"
+        assert kwargs["timeout"] == 15
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=0, stdout="Social connection status:\n- Meta: connected\n", stderr="")
+
+    channel._handle_message = capture_handle
+    monkeypatch.setattr("nanobot.channels.telegram.subprocess.run", fake_run)
+
+    await channel._forward_command(_make_telegram_update(text="/connection_status@nanobot_test"), None)
+
+    assert handled == []
+    assert channel._app.bot.sent_messages
+    assert "Social connection status" in channel._app.bot.sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_on_help_includes_restart_command() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),

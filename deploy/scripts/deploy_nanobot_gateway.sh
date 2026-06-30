@@ -3,7 +3,7 @@ set -euo pipefail
 
 SOURCE_DIR="${1:-$(pwd)}"
 INSTALL_DIR="${MARKETING_AGENT_NANOBOT_DIR:-/opt/marketing-agent/nanobot-custom}"
-CONFIG_FILE="${MARKETING_AGENT_NANOBOT_CONFIG:-/opt/marketing-agent/secrets/nanobot-config.json}"
+CONFIG_FILE="${MARKETING_AGENT_NANOBOT_CONFIG:-/opt/marketing-agent/.nanobot/config.json}"
 ENV_FILE="${MARKETING_AGENT_NANOBOT_ENV:-/opt/marketing-agent/secrets/nanobot.env}"
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -25,6 +25,9 @@ INSTALL_REALPATH="$(realpath -m "${INSTALL_DIR}")"
 install -d -m 0750 -o marketing-agent -g marketing-agent "${INSTALL_DIR}"
 install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/.nanobot
 install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/.nanobot/workspace
+install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/.cache
+install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/.codex
+install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/.local
 install -d -m 0750 -o marketing-agent -g marketing-agent /opt/marketing-agent/logs
 install -d -m 0750 -o root -g marketing-agent /opt/marketing-agent/secrets
 touch /opt/marketing-agent/logs/nanobot-gateway.log

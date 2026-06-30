@@ -10,14 +10,14 @@ Group=marketing-agent
 WorkingDirectory=/opt/marketing-agent/client-marketing-assistance
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/marketing-agent/secrets/nanobot.env
-ExecStart=/opt/marketing-agent/nanobot-custom/.venv/bin/nanobot gateway --config /opt/marketing-agent/secrets/nanobot-config.json --log-file /opt/marketing-agent/logs/nanobot-gateway.log
+ExecStart=/opt/marketing-agent/nanobot-custom/.venv/bin/nanobot gateway --config /opt/marketing-agent/.nanobot/config.json --log-file /opt/marketing-agent/logs/nanobot-gateway.log
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=false
-ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs
+ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs /opt/marketing-agent/.cache /opt/marketing-agent/.codex /opt/marketing-agent/.local
 
 [Install]
 WantedBy=multi-user.target

@@ -29,7 +29,15 @@
       "allowChats": [],
       "replyToMessage": true,
       "groupPolicy": "mention",
-      "streaming": true
+      "streaming": true,
+      "fastCommandWorkdir": "/opt/marketing-agent/client-marketing-assistance",
+      "fastCommandTimeout": 120,
+      "fastCommands": {
+        "/connection_status": ["python3", "scripts/check_social_connection.py"],
+        "/connect_meta": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "meta"],
+        "/connect_tiktok": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "tiktok"],
+        "/sync_meta_analytics": ["python3", "scripts/fetch_meta_metrics.py", "--limit", "25"]
+      }
     }
   },
   "providers": {
