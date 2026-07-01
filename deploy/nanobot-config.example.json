@@ -20,7 +20,7 @@
     }
   },
   "channels": {
-    "taskUpdateMode": "plan_result",
+    "taskUpdateMode": "result",
     "sendToolHints": false,
     "telegram": {
       "enabled": true,
