@@ -535,7 +535,8 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     )
 
     assert final_content == "Hello"
-    assert deltas == ["Hello"]
+    # Deltas are now forwarded raw (think-tag stripping happens at the renderer level)
+    assert deltas == ["<think>hidden", "</think>Hello"]
     assert endings == [False]
 
 
@@ -577,7 +578,8 @@ async def test_loop_streaming_suppresses_intermediate_tool_preamble(tmp_path):
 
     assert final_content == "All set."
     assert tools_used == ["list_dir"]
-    assert deltas == ["All set."]
+    # Deltas are now forwarded live for every iteration (not just the final one)
+    assert deltas == ["Checking the repo now.", "All set."]
     assert endings == [True, False]
 
 

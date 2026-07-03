@@ -95,14 +95,13 @@ class _LoopHook(AgentHook):
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         self._stream_buf += delta
+        if self._on_stream:
+            await self._on_stream(delta)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        if not resuming and self._on_stream:
-            from nanobot.utils.helpers import strip_think
-
-            final_clean = strip_think(self._stream_buf)
-            if final_clean:
-                await self._on_stream(final_clean)
+        # Deltas are forwarded live during streaming; no need to re-send the
+        # full buffer at the end (that would duplicate the content).
+        # Think-tag stripping is handled by the renderer's _render().
         if self._on_stream_end:
             await self._on_stream_end(resuming=resuming)
         self._stream_buf = ""
