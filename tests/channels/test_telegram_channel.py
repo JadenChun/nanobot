@@ -622,6 +622,8 @@ async def test_send_remote_media_url_after_security_validation(monkeypatch) -> N
             "kind": "photo",
             "chat_id": 123,
             "photo": "https://example.com/cat.jpg",
+            "caption": "Attached file.",
+            "parse_mode": "HTML",
             "reply_parameters": None,
         }
     ]

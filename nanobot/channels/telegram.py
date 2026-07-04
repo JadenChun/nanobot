@@ -424,6 +424,8 @@ class TelegramChannel(BaseChannel):
             candidate_caption = _markdown_to_telegram_html(content)
             if len(candidate_caption) <= TELEGRAM_MAX_CAPTION_LEN:
                 caption_html = candidate_caption
+        elif media_paths:
+            caption_html = "Attached file."
 
         # Long summaries cannot be captions, so send the text before files to
         # avoid a blank-looking attachment message in Telegram exports.
