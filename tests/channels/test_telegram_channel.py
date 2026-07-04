@@ -12,6 +12,7 @@ except ImportError:
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
+    TELEGRAM_MAX_CAPTION_LEN,
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
     TelegramConfig,
@@ -624,6 +625,56 @@ async def test_send_remote_media_url_after_security_validation(monkeypatch) -> N
             "reply_parameters": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_media_uses_short_content_as_caption(tmp_path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nDetails", encoding="utf-8")
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Done - full report attached.",
+            media=[str(report)],
+        )
+    )
+
+    assert channel._app.bot.sent_messages == []
+    assert channel._app.bot.sent_media[0]["kind"] == "document"
+    assert channel._app.bot.sent_media[0]["caption"] == "Done - full report attached."
+    assert channel._app.bot.sent_media[0]["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_send_media_sends_long_content_as_text_before_attachment(tmp_path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nDetails", encoding="utf-8")
+    long_content = "x" * (TELEGRAM_MAX_CAPTION_LEN + 1)
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content=long_content,
+            media=[str(report)],
+        )
+    )
+
+    assert channel._app.bot.sent_messages[0]["text"] == long_content
+    assert channel._app.bot.sent_media[0]["kind"] == "document"
+    assert "caption" not in channel._app.bot.sent_media[0]
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_MAX_CAPTION_LEN = 1000  # Telegram caption limit is 1024; keep margin for HTML conversion
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
 
 
@@ -416,8 +417,22 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
+        content = msg.content if msg.content and msg.content != "[empty message]" else ""
+        media_paths = list(msg.media or [])
+        caption_html = ""
+        if content and media_paths:
+            candidate_caption = _markdown_to_telegram_html(content)
+            if len(candidate_caption) <= TELEGRAM_MAX_CAPTION_LEN:
+                caption_html = candidate_caption
+
+        # Long summaries cannot be captions, so send the text before files to
+        # avoid a blank-looking attachment message in Telegram exports.
+        if content and not caption_html:
+            for chunk in split_message(content, TELEGRAM_MAX_MESSAGE_LEN):
+                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+
         # Send media files
-        for media_path in (msg.media or []):
+        for index, media_path in enumerate(media_paths):
             try:
                 media_type = self._get_media_type(media_path)
                 sender = {
@@ -426,6 +441,12 @@ class TelegramChannel(BaseChannel):
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
                 param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                caption_kwargs = {}
+                if index == 0 and caption_html:
+                    caption_kwargs = {
+                        "caption": caption_html,
+                        "parse_mode": "HTML",
+                    }
 
                 # Telegram Bot API accepts HTTP(S) URLs directly for media params.
                 if self._is_remote_media_url(media_path):
@@ -436,6 +457,7 @@ class TelegramChannel(BaseChannel):
                         sender,
                         chat_id=chat_id,
                         **{param: media_path},
+                        **caption_kwargs,
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
@@ -445,6 +467,7 @@ class TelegramChannel(BaseChannel):
                     await sender(
                         chat_id=chat_id,
                         **{param: f},
+                        **caption_kwargs,
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
@@ -457,11 +480,6 @@ class TelegramChannel(BaseChannel):
                     reply_parameters=reply_params,
                     **thread_kwargs,
                 )
-
-        # Send text content
-        if msg.content and msg.content != "[empty message]":
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
     async def _call_with_retry(self, fn, *args, **kwargs):
         """Call an async Telegram API function with retry on pool/network timeout."""
