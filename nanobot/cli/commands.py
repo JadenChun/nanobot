@@ -778,6 +778,7 @@ def gateway(
                     chat_id=job.payload.to or "direct",
                     planning_mode=job.payload.planning_mode,
                     skip_verification=job.payload.skip_verification,
+                    approval_granted=True,
                 )
             except Exception as exc:
                 agent.record_task_failure(

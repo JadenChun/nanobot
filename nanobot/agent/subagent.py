@@ -521,6 +521,7 @@ class SubagentManager:
                 scaling_enabled=self.desktop_use_config.scaling_enabled,
                 max_output_chars=self.desktop_use_config.max_output_chars,
                 working_dir=str(self.workspace),
+                humanize_typing=self.desktop_use_config.humanize_typing,
             ))
 
     def _build_generation_tools(

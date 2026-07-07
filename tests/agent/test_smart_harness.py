@@ -281,6 +281,17 @@ def test_risky_action_policy_detects_large_overwrite(tmp_path):
     assert "overwrite a large portion" in reason
 
 
+def test_risky_action_policy_skips_small_state_file_overwrite(tmp_path):
+    """Tiny state files (e.g. previous_app.txt) should not trip the 'large portion' guard."""
+    target = tmp_path / "previous_app.txt"
+    target.write_text("Arc", encoding="utf-8")
+
+    policy = RiskyActionPolicy(workspace=tmp_path)
+    reason = policy._risky_write_reason(str(target), "GitHub Desktop")
+
+    assert reason is None
+
+
 def test_risky_action_policy_skips_approval_for_writable_managed_target_repo_path(tmp_path, monkeypatch):
     context_repo = tmp_path / "pota"
     target_repo = tmp_path / "website"

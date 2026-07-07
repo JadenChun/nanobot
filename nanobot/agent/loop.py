@@ -445,6 +445,7 @@ class AgentLoop:
                 scaling_enabled=self.desktop_use_config.scaling_enabled,
                 max_output_chars=self.desktop_use_config.max_output_chars,
                 working_dir=str(self.workspace),
+                humanize_typing=self.desktop_use_config.humanize_typing,
             ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -1839,6 +1840,7 @@ End your response with exactly:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         planning_mode_override: str | None = None,
         skip_verification: bool = False,
+        approval_granted: bool = False,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -2078,7 +2080,7 @@ End your response with exactly:
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
-            approval_granted=approval_note is not None,
+            approval_granted=approval_granted or approval_note is not None,
             planned=planned,
             skip_verification=skip_verification,
         )
@@ -2111,7 +2113,7 @@ End your response with exactly:
             chat_id=msg.chat_id,
             task_text=current_message,
             response_text=final_content,
-            approval_granted=approval_note is not None,
+            approval_granted=approval_granted or approval_note is not None,
         )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -2268,6 +2270,7 @@ End your response with exactly:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         planning_mode: str | None = None,
         skip_verification: bool = False,
+        approval_granted: bool = False,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -2277,4 +2280,5 @@ End your response with exactly:
             on_stream=on_stream, on_stream_end=on_stream_end,
             planning_mode_override=planning_mode,
             skip_verification=skip_verification,
+            approval_granted=approval_granted,
         )

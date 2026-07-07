@@ -222,6 +222,7 @@ class DesktopUseConfig(Base):
     typing_delay_ms: int = 12  # per-character delay during `type`
     scaling_enabled: bool = True  # downscale coords to XGA/WXGA/FWXGA
     max_output_chars: int = 12000
+    humanize_typing: bool = True  # jittered human-like inter-key delays during `type`
 
 
 class ExecToolConfig(Base):

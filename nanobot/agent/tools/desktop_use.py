@@ -28,8 +28,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import platform
+import random
 import tempfile
 import time
 from typing import Any
@@ -77,6 +79,31 @@ _KEY_ALIASES = {
     "home": "Home", "end": "End", "pageup": "PageUp", "pagedown": "PageDown",
 }
 
+# ── Human-like typing model ─────────────────────────────────────────────
+# When ``humanize_typing`` is on, inter-key delays are drawn from a log-normal
+# distribution around a mean derived from ``typing_delay_ms`` (clamped to a
+# realistic floor so even a 12ms config still reads as human). Real typists
+# average ~100ms between keys with a long right tail; we shape the jitter
+# accordingly and apply small multipliers for common bigrams (muscle memory)
+# and a penalty for shifted/punctuation chars (slower to reach).
+_HUMAN_MIN_MEAN_MS = 70          # never faster than this even if config asks
+_HUMAN_MAX_MEAN_MS = 220         # never slower than this baseline
+_HUMAN_JITTER_SIGMA = 0.35       # log-normal sigma — moderate spread
+_HUMAN_PAUSE_PROB = 0.04         # 4% chance of a brief "thinking" pause
+_HUMAN_PAUSE_MS_LO = 180
+_HUMAN_PAUSE_MS_HI = 520
+_HUMAN_FIRST_KEY_BONUS_LO = 90   # extra delay before the very first key
+_HUMAN_FIRST_KEY_BONUS_HI = 260
+_HUMAN_SPACE_MS_BONUS = 30       # spaces are slightly slower than letters
+
+# Bigrams that experienced typists chunk as one motion -> shorter delay.
+_FAST_BIGRAMS = frozenset({
+    "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
+    "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
+    "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le",
+    "ve", "co", "me", "de", "hi", "ri", "ro", "ic", "ne", "ea",
+})
+
 
 class DesktopUseTool(Tool):
     """Stateless pixel-coordinate desktop driver (Operator / Anthropic style)."""
@@ -88,12 +115,14 @@ class DesktopUseTool(Tool):
         scaling_enabled: bool = True,
         max_output_chars: int = 12000,
         working_dir: str | None = None,
+        humanize_typing: bool = True,
     ):
         self.screenshot_delay = max(0.0, float(screenshot_delay))
         self.typing_delay_ms = max(0, int(typing_delay_ms))
         self.scaling_enabled = bool(scaling_enabled)
         self.max_output_chars = max_output_chars
         self.working_dir = working_dir
+        self.humanize_typing = bool(humanize_typing)
         self._backend: _Backend | None = None
         self._backend_error: str | None = None
 
@@ -282,7 +311,10 @@ class DesktopUseTool(Tool):
                     return self._error("text is required for `type`")
                 if len(text) > 4000:
                     return self._error("text too long (max 4000 chars per call)")
-                await asyncio.to_thread(backend.type_text, text, self.typing_delay_ms)
+                delays = self._human_delays(text) if self.humanize_typing else None
+                await asyncio.to_thread(
+                    backend.type_text, text, self.typing_delay_ms, delays,
+                )
                 return self._ok({"typed_chars": len(text)})
 
             if action == "key":
@@ -312,6 +344,54 @@ class DesktopUseTool(Tool):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _human_delays(self, text: str) -> list[int]:
+        """Per-character inter-key delays (ms) that look like a real typist.
+
+        The first key gets an extra startup latency (hands moving to the
+        keyboard). Subsequent delays are drawn from a log-normal around the
+        configured mean (clamped to a realistic human band), with bigram
+        muscle-memory boosts and a small chance of a brief "thinking" pause.
+        Spaces and shifted/punctuation chars get a small extra cost.
+        """
+        mean = max(
+            _HUMAN_MIN_MEAN_MS,
+            min(_HUMAN_MAX_MEAN_MS, self.typing_delay_ms if self.typing_delay_ms > 0 else 90),
+        )
+        n = len(text)
+        delays: list[int] = []
+        for i in range(n):
+            ch = text[i]
+            mu = float(mean)
+            # Common bigram muscle memory -> faster.
+            if i > 0:
+                pair = (text[i - 1] + ch).lower()
+                if pair in _FAST_BIGRAMS:
+                    mu *= 0.55
+            # Spaces are slightly slower than letters.
+            if ch == " ":
+                mu += _HUMAN_SPACE_MS_BONUS
+            # Punctuation / digits / uppercase (= shifted) cost more.
+            if not ch.isalpha() or ch.isupper():
+                mu *= 1.18
+            # Log-normal jitter (always positive, long right tail).
+            d = self._lognormal_ms(mu)
+            # Occasional brief "thinking" pause folded into the same delay
+            # so per-char count stays exactly n.
+            if i < n - 1 and random.random() < _HUMAN_PAUSE_PROB:
+                d = min(2000, d + random.randint(_HUMAN_PAUSE_MS_LO, _HUMAN_PAUSE_MS_HI))
+            delays.append(d)
+        # Extra startup latency after the very first keystroke (orienting
+        # before continuing the rest of the word).
+        if delays:
+            delays[0] = delays[0] + random.randint(_HUMAN_FIRST_KEY_BONUS_LO, _HUMAN_FIRST_KEY_BONUS_HI)
+        return delays
+
+    @staticmethod
+    def _lognormal_ms(mean: float) -> int:
+        mu_ln = math.log(max(1.0, mean))
+        sample = random.lognormvariate(mu_ln, _HUMAN_JITTER_SIGMA)
+        return max(12, min(900, int(round(sample))))
 
     def _get_backend(self) -> "_Backend | None":
         if self._backend is not None:
@@ -453,7 +533,7 @@ class _Backend:
     def mouse_click(self, x: int, y: int, button: str, clicks: int) -> None: ...
     def mouse_drag(self, x1: int, y1: int, x2: int, y2: int) -> None: ...
     def scroll(self, direction: str, amount: int) -> None: ...
-    def type_text(self, text: str, delay_ms: int) -> None: ...
+    def type_text(self, text: str, delay_ms: int, delays_ms: list[int] | None = None) -> None: ...
     def key_chord(self, chord: str) -> None: ...
     def hold_key(self, chord: str, duration: float) -> None: ...
 
@@ -632,8 +712,14 @@ class _MacBackend(_Backend):
 
     # -- keyboard --------------------------------------------------------------
 
-    def type_text(self, text: str, delay_ms: int) -> None:
+    def type_text(self, text: str, delay_ms: int, delays_ms: list[int] | None = None) -> None:
         Q = self.Quartz
+        # When per-character delays are supplied (humanize mode), use them
+        # in order; otherwise fall back to the uniform fixed delay.
+        if delays_ms:
+            delays_iter = iter(delays_ms)
+        else:
+            delays_iter = None
         for ch in text:
             evt_down = Q.CGEventCreateKeyboardEvent(None, 0, True)
             evt_up = Q.CGEventCreateKeyboardEvent(None, 0, False)
@@ -645,8 +731,20 @@ class _MacBackend(_Backend):
             Q.CGEventKeyboardSetUnicodeString(evt_up, len(buf) // 2, ch)
             Q.CGEventPost(Q.kCGHIDEventTap, evt_down)
             Q.CGEventPost(Q.kCGHIDEventTap, evt_up)
-            if delay_ms > 0:
-                time.sleep(delay_ms / 1000.0)
+            # Pick the delay for this keystroke. With humanize mode the
+            # generator may yield MORE entries than chars (each entry is
+            # "the gap after position k"); the first entry is the pre-first
+            # keystroke startup latency, so we sleep *before* the next char.
+            cur: int = 0
+            if delays_iter is not None:
+                try:
+                    cur = int(next(delays_iter))
+                except StopIteration:
+                    cur = delay_ms
+            else:
+                cur = delay_ms
+            if cur > 0:
+                time.sleep(cur / 1000.0)
 
     def key_chord(self, chord: str) -> None:
         Q = self.Quartz

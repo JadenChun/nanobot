@@ -7,6 +7,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import secrets
 import string
 import time
@@ -670,6 +671,123 @@ class OpenAICompatProvider(LLMProvider):
             result.append({"role": "user", "content": user_parts})
         return result
 
+    # ------------------------------------------------------------------
+    # Vision fallback: describe images via a vision-capable model when
+    # the primary model rejects image content.
+    # ------------------------------------------------------------------
+
+    async def _describe_images_via_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        reason: str = "vision",
+    ) -> list[dict[str, Any]] | None:
+        """Describe images via the configured vision fallback model.
+
+        Collects all ``image_url`` blocks from *messages*, sends them to the
+        vision fallback model (e.g. ``mimo-v2.5``) with a "describe this
+        image" prompt, and replaces each ``image_url`` block with a ``text``
+        block containing the description.
+
+        Returns the modified messages, or ``None`` if no fallback model is
+        configured or the fallback call failed (caller falls back to
+        :meth:`_strip_image_content`).
+        """
+        spec = self._spec
+        if not spec or not getattr(spec, "vision_fallback_model", None):
+            return None
+
+        # Collect image_url blocks and their (msg_idx, blk_idx) locations.
+        image_blocks: list[dict[str, Any]] = []
+        image_locations: set[tuple[int, int]] = set()
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for blk_idx, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    image_blocks.append(block)
+                    image_locations.add((msg_idx, blk_idx))
+
+        if not image_blocks:
+            return None
+
+        vision_model = spec.vision_fallback_model
+        # Build a single user message asking the vision model to describe
+        # every image, preserving order so we can map descriptions back.
+        desc_parts: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                "Describe each image below. For each image, provide a concise "
+                "but complete description including: UI elements, visible text, "
+                "layout, colors, and current state. Number your descriptions "
+                "Image 1, Image 2, etc. in the order they appear."
+            ),
+        }]
+        desc_parts.extend(image_blocks)
+        vision_messages: list[dict[str, Any]] = [
+            {"role": "user", "content": desc_parts},
+        ]
+
+        try:
+            response = await self._safe_chat(
+                messages=vision_messages,
+                tools=None,
+                model=vision_model,
+                max_tokens=2048,
+                temperature=0.3,
+                reasoning_effort=None,
+                tool_choice=None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Vision fallback (model={}) call failed: {}. "
+                "Falling back to image stripping.",
+                vision_model, exc,
+            )
+            return None
+
+        if response.finish_reason == "error" or not response.content:
+            logger.warning(
+                "Vision fallback (model={}) returned an error: {}. "
+                "Falling back to image stripping.",
+                vision_model, (response.content or "")[:200],
+            )
+            return None
+
+        description = response.content.strip()
+        # Split by "Image N" markers if the model followed instructions.
+        segments = re.split(r"\n(?=Image \d+)", description)
+        if len(segments) >= len(image_blocks):
+            descriptions = [s.strip() for s in segments[:len(image_blocks)]]
+        else:
+            # Model didn't number them; use the whole description for each image.
+            descriptions = [description] * len(image_blocks)
+
+        # Replace image_url blocks with text descriptions.
+        result: list[dict[str, Any]] = []
+        img_counter = 0
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+            new_content: list[Any] = []
+            for blk_idx, block in enumerate(content):
+                if (msg_idx, blk_idx) in image_locations:
+                    path = (block.get("_meta") or {}).get("path", "")
+                    desc = descriptions[img_counter] if img_counter < len(descriptions) else description
+                    note = f"[Image described by {vision_model}"
+                    if path:
+                        note += f" (path={path})"
+                    note += f"]:\n{desc}"
+                    new_content.append({"type": "text", "text": note})
+                    img_counter += 1
+                else:
+                    new_content.append(block)
+            result.append({**msg, "content": new_content})
+        return result
+
     @classmethod
     def _content_to_responses_parts(
         cls,
@@ -1185,12 +1303,17 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=(
+                getattr(msg, "reasoning_content", None)
+                or (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+                or None
+            ),
         )
 
     @classmethod
     def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
@@ -1244,6 +1367,9 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
+                rc = delta.get("reasoning_content")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
                     _accum_tc(tc, idx)
                 usage = cls._extract_usage(chunk_map) or usage
@@ -1258,6 +1384,10 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
+            if delta:
+                rc = getattr(delta, "reasoning_content", None)
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
 
@@ -1276,6 +1406,7 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
         )
 
     @staticmethod
