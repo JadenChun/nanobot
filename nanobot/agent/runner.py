@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.policy import ToolPolicy, ToolPolicyDecision
 from nanobot.agent.tools.registry import ToolRegistry
@@ -161,6 +163,12 @@ class AgentRunSpec:
     tool_result_clear_trigger_tokens: int | None = None
     tool_result_clear_target_tokens: int | None = None
     tool_policy: ToolPolicy | None = None
+    # Hard ceiling on prompt tokens.  When set, the runner will trim the
+    # oldest conversation turns (assistant + tool pairs) at the top of each
+    # iteration to keep the context within budget.  This prevents the
+    # gradual context growth that causes inference slowdown on resource-
+    # constrained devices.
+    max_input_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -254,6 +262,17 @@ class AgentRunner:
                     tools=spec.tools.get_definitions(),
                     trigger_tokens=spec.tool_result_clear_trigger_tokens,
                     target_tokens=spec.tool_result_clear_target_tokens,
+                )
+
+            # Hard ceiling: if the accumulated context (system prompt + history
+            # + tool results) exceeds max_input_tokens, drop the oldest
+            # assistant+tool pairs.  Without this, multi-turn cron jobs on
+            # resource-constrained devices gradually exceed the model's context
+            # window and time out.
+            if spec.max_input_tokens and spec.max_input_tokens > 0 and iteration > 0:
+                self._trim_context_to_budget(
+                    messages,
+                    spec=spec,
                 )
 
             context = AgentHookContext(iteration=iteration, messages=messages)
@@ -496,3 +515,61 @@ class AgentRunner:
             "status": status,
             "detail": detail,
         }, None
+
+    def _trim_context_to_budget(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        spec: AgentRunSpec,
+    ) -> None:
+        """Drop the oldest assistant+tool turn pairs to stay within *max_input_tokens*.
+
+        The system message and the first user message are never removed.
+        Assistant messages that contain tool_calls are kept together with
+        their subsequent tool-result messages so the conversation remains
+        well-formed for the LLM API.
+        """
+        max_tokens = spec.max_input_tokens
+        if not max_tokens:
+            return
+
+        tool_defs = spec.tools.get_definitions()
+        tokens, _ = estimate_prompt_tokens_chain(
+            self.provider, spec.model, messages, tool_defs,
+        )
+        if tokens <= max_tokens:
+            return
+
+        # Identify turn boundaries: an assistant message (possibly with
+        # tool_calls) followed by its tool results forms one "turn".
+        turns: list[tuple[int, int]] = []  # (start_idx, end_idx) inclusive
+        i = 1  # skip system message at index 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant":
+                start = i
+                i += 1
+                # Consume subsequent tool-result messages belonging to this turn.
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    i += 1
+                turns.append((start, i - 1))
+            else:
+                i += 1
+
+        # Drop oldest turns until we are within budget (keep at least 1 turn).
+        dropped = 0
+        for start, end in turns[:-1]:
+            # Remove messages[start:end+1] in-place.
+            del messages[start:end + 1]
+            dropped += 1
+            tokens, _ = estimate_prompt_tokens_chain(
+                self.provider, spec.model, messages, tool_defs,
+            )
+            if tokens <= max_tokens:
+                break
+
+        if dropped:
+            logger.info(
+                "Mid-loop context trim: dropped {} old turn(s) to reach {} tokens (budget {})",
+                dropped, tokens, max_tokens,
+            )

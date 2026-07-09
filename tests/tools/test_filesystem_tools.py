@@ -434,3 +434,74 @@ class TestWorkspaceRestriction:
 
         assert "currently locked" in result
         assert "main:session-a" in result
+
+
+# ---------------------------------------------------------------------------
+# _resolve_path – /workspace/ alias
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceAlias:
+    """Docker-style /workspace/... paths must be rewritten to the host workspace."""
+
+    def test_rewrite_absolute_workspace_path(self, tmp_path):
+        from nanobot.agent.tools.filesystem import _resolve_path
+
+        target = tmp_path / "previous_app.txt"
+        target.write_text("GitHub Desktop")
+
+        resolved = _resolve_path("/workspace/previous_app.txt", workspace=tmp_path)
+        assert resolved == target.resolve()
+
+    def test_rewrite_nested_path(self, tmp_path):
+        from nanobot.agent.tools.filesystem import _resolve_path
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        target = sub / "file.txt"
+        target.write_text("hello")
+
+        resolved = _resolve_path("/workspace/sub/file.txt", workspace=tmp_path)
+        assert resolved == target.resolve()
+
+    def test_exact_workspace_alias(self, tmp_path):
+        from nanobot.agent.tools.filesystem import _resolve_path
+
+        resolved = _resolve_path("/workspace", workspace=tmp_path)
+        assert resolved == tmp_path.resolve()
+
+    def test_non_alias_absolute_path_unchanged(self, tmp_path):
+        from nanobot.agent.tools.filesystem import _resolve_path
+        from pathlib import Path
+
+        # A non-/workspace/ absolute path should NOT be rewritten.
+        resolved = _resolve_path("/tmp/some_file.txt", workspace=tmp_path)
+        # macOS resolves /tmp → /private/tmp; compare via Path.resolve() for portability.
+        assert resolved == Path("/tmp/some_file.txt").resolve()
+
+    def test_relative_path_still_resolves_against_workspace(self, tmp_path):
+        from nanobot.agent.tools.filesystem import _resolve_path
+
+        target = tmp_path / "relative.txt"
+        target.write_text("data")
+
+        resolved = _resolve_path("relative.txt", workspace=tmp_path)
+        assert resolved == target.resolve()
+
+    def test_no_workspace_no_rewrite(self):
+        from nanobot.agent.tools.filesystem import _resolve_path
+
+        # Without a workspace, /workspace/... stays as-is (no rewrite).
+        resolved = _resolve_path("/workspace/foo.txt")
+        assert str(resolved) == "/workspace/foo.txt"
+
+    @pytest.mark.asyncio
+    async def test_read_file_with_workspace_alias(self, tmp_path):
+        """End-to-end: ReadFileTool must transparently resolve /workspace/ paths."""
+        target = tmp_path / "notes.md"
+        target.write_text("important note", encoding="utf-8")
+
+        tool = ReadFileTool(workspace=tmp_path)
+        # We call with the Docker-style path; the tool must find the file.
+        result = await tool.execute(path="/workspace/notes.md")
+        assert "important note" in result
+        assert "Error" not in result

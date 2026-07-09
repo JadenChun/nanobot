@@ -1479,6 +1479,7 @@ End your response with exactly:
                 None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
             ),
             tool_policy=tool_policy,
+            max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -1532,6 +1533,7 @@ End your response with exactly:
         approval_granted: bool = False,
         planned: _PlanDecision | None = None,
         skip_verification: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> AgentRunResult:
         policy = RiskyActionPolicy(
             workspace=self.workspace,
@@ -1551,6 +1553,7 @@ End your response with exactly:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            tools=tools,
             tool_policy=policy,
             channel=channel,
             chat_id=chat_id,
@@ -1841,6 +1844,7 @@ End your response with exactly:
         planning_mode_override: str | None = None,
         skip_verification: bool = False,
         approval_granted: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1861,8 +1865,8 @@ End your response with exactly:
 
             if self.max_tokens.input > 0:
                 try:
-                    tools = self.tools.get_definitions()
-                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, tools)
+                    sys_tool_defs = self.tools.get_definitions()
+                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, sys_tool_defs)
                     if tokens > self.max_tokens.input:
                         logger.warning(
                             "System context size ({}) exceeds maxTokens.input ({}). Trimming oldest turns.",
@@ -1882,7 +1886,7 @@ End your response with exactly:
                                 self.provider,
                                 self.model,
                                 messages,
-                                tools,
+                                sys_tool_defs,
                             )
                 except Exception as e:
                     logger.error("Failed to check system token count: {}", e)
@@ -1958,7 +1962,9 @@ End your response with exactly:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        tools = self.tools.get_definitions()
+        # Use filtered tool set if provided, otherwise full set.
+        effective_tools = tools if tools is not None else self.tools
+        tool_defs = effective_tools.get_definitions()
         clear_trigger_tokens, clear_target_tokens = self._tool_result_clear_thresholds()
 
         # Compact old tool results only when prompt size is approaching the budget.
@@ -1967,7 +1973,7 @@ End your response with exactly:
             keep_last=self.tool_result_clearing_keep,
             provider=self.provider,
             model=self.model,
-            tools=tools,
+            tools=tool_defs,
             trigger_tokens=clear_trigger_tokens,
             target_tokens=clear_target_tokens,
         )
@@ -1979,7 +1985,7 @@ End your response with exactly:
                     self.provider,
                     self.model,
                     initial_messages,
-                    tools,
+                    tool_defs,
                 )
                 if tokens > self.max_tokens.input:
                     logger.warning(
@@ -2000,7 +2006,7 @@ End your response with exactly:
                             self.provider,
                             self.model,
                             initial_messages,
-                            tools,
+                            tool_defs,
                         )
             except Exception as e:
                 logger.error("Failed to check token count: {}", e)
@@ -2083,6 +2089,7 @@ End your response with exactly:
             approval_granted=approval_granted or approval_note is not None,
             planned=planned,
             skip_verification=skip_verification,
+            tools=tools,
         )
         final_content = result.final_content
         all_msgs = result.messages
@@ -2271,9 +2278,17 @@ End your response with exactly:
         planning_mode: str | None = None,
         skip_verification: bool = False,
         approval_granted: bool = False,
+        tool_names: list[str] | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        *tool_names*: optional whitelist of tool names to expose.  When set,
+        only the listed tools are available to the agent, which reduces the
+        system prompt token count — useful for lightweight scheduled tasks on
+        resource-constrained devices.
+        """
         await self._connect_mcp()
+        tools = self.tools.filtered(tool_names) if tool_names else None
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
@@ -2281,4 +2296,5 @@ End your response with exactly:
             planning_mode_override=planning_mode,
             skip_verification=skip_verification,
             approval_granted=approval_granted,
+            tools=tools,
         )

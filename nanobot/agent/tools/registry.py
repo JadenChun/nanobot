@@ -73,3 +73,12 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+    def filtered(self, names: list[str]) -> "ToolRegistry":
+        """Return a new registry containing only the named tools."""
+        reg = ToolRegistry()
+        for name in names:
+            tool = self._tools.get(name)
+            if tool is not None:
+                reg.register(tool)
+        return reg

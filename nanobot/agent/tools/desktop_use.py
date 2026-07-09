@@ -195,8 +195,11 @@ class DesktopUseTool(Tool):
                 "text": {
                     "type": "string",
                     "description": (
-                        "Text to type (`type`) or key chord to press "
-                        "(`key` / `hold_key`, e.g. 'Cmd+S', 'Return')."
+                        "REQUIRED for `type`, `key`, and `hold_key` actions. "
+                        "For `type`: the text string to type. "
+                        "For `key` / `hold_key`: the key chord to press "
+                        "(e.g. 'Cmd+S', 'Return', 'Cmd+Space'). "
+                        "Not used by other actions."
                     ),
                 },
                 "scroll_direction": {
