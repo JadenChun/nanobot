@@ -150,6 +150,7 @@ class OpenAICompatProvider(LLMProvider):
         timeout: float = 60.0,
         spec: ProviderSpec | None = None,
         token_provider: Callable[[], str] | None = None,
+        keep_alive_interval: float = 0.0,
     ):
         key_pool = [k for k in (api_keys or []) if k]
         if not key_pool and api_key:
@@ -184,6 +185,8 @@ class OpenAICompatProvider(LLMProvider):
             default_headers.update(extra_headers)
         self._effective_base = effective_base
         self._default_headers = default_headers
+        self._keep_alive_interval = max(0.0, float(keep_alive_interval))
+        self._keep_alive_task: asyncio.Task | None = None
 
         if self.api_key and self._spec and self._spec.env_key:
             self._setup_env(self.api_key, self.api_base)
@@ -195,6 +198,56 @@ class OpenAICompatProvider(LLMProvider):
         idx = 0 if index is None else (index % len(self._api_keys))
         digest = hashlib.sha1(self._api_keys[idx].encode()).hexdigest()[:8]
         return f"key#{idx + 1}/{len(self._api_keys)}[{digest}]"
+
+    def start_keep_alive(self) -> None:
+        """Start a background keep-alive ping to prevent cold starts.
+        
+        Only effective if keep_alive_interval > 0 was set in constructor.
+        Sends minimal 'ping' requests to keep the LLM warm.
+        """
+        if self._keep_alive_interval <= 0:
+            return
+        if self._keep_alive_task is not None and not self._keep_alive_task.done():
+            return
+        self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
+        logger.info("Keep-alive ping started (every {:.0f}s)", self._keep_alive_interval)
+
+    def stop_keep_alive(self) -> None:
+        """Stop the keep-alive ping."""
+        if self._keep_alive_task is not None:
+            self._keep_alive_task.cancel()
+            self._keep_alive_task = None
+
+    async def _keep_alive_loop(self) -> None:
+        """Background loop that sends minimal ping requests."""
+        while True:
+            try:
+                await asyncio.sleep(self._keep_alive_interval)
+                await self._send_ping()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Keep-alive ping failed: {}", e)
+
+    async def _send_ping(self) -> None:
+        """Send a minimal ping request to keep the LLM warm."""
+        client = self._build_client()
+        try:
+            await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.default_model,
+                    messages=[
+                        {"role": "system", "content": "Reply with exactly: pong"},
+                        {"role": "user", "content": "ping"},
+                    ],
+                    max_tokens=4,
+                    temperature=0.0,
+                ),
+                timeout=30.0,  # Short timeout for ping
+            )
+            logger.debug("Keep-alive ping: pong received")
+        except Exception as e:
+            logger.debug("Keep-alive ping timeout/error: {}", e)
 
     def _next_request_start(self) -> int:
         """Round-robin the starting key so concurrent requests do not share mutable state."""
@@ -358,7 +411,11 @@ class OpenAICompatProvider(LLMProvider):
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
-        """Return True when exception indicates quota/rate limiting or temporary overload."""
+        """Return True when exception indicates quota/rate limiting or temporary overload.
+        
+        Note: Timeouts are NOT considered rate-limit errors - they indicate
+        connectivity issues, not quota exhaustion.
+        """
         status = getattr(exc, "status_code", None)
         if status is None:
             resp = getattr(exc, "response", None)
@@ -366,14 +423,15 @@ class OpenAICompatProvider(LLMProvider):
         if status in (429, 503):
             return True
         msg = str(exc).lower()
+        # Explicitly exclude timeout-related errors
+        if "timeout" in msg or "timed out" in msg:
+            return False
         return any(m in msg for m in (
             "rate limit",
             "rate_limit",
             "quota",
             "resource_exhausted",
             "429",
-            "timeout",
-            "timed out",
             "unavailable",
             "service unavailable",
             "high demand",
@@ -1449,6 +1507,18 @@ class OpenAICompatProvider(LLMProvider):
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
                     )
+                
+                # Debug: log request size before sending
+                try:
+                    msg_count = len(messages)
+                    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+                    logger.debug(
+                        "LLM request: model={}, messages={}, ~{} chars, api_base={}",
+                        resolved_model, msg_count, total_chars, self._api_base,
+                    )
+                except Exception:
+                    pass  # Debug logging should never break the request flow
+                
                 await self._wait_for_rate_limit()
                 if len(self._api_keys) > 1:
                     logger.info(

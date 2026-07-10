@@ -186,6 +186,13 @@ def _make_single_provider(config: Any, provider_name: str, model: str) -> Any:
             for k, v in copilot_auth.copilot_request_headers().items():
                 merged_headers.setdefault(k, v)
 
+        # Determine keep-alive interval for local providers
+        _is_local_endpoint = (
+            (spec and spec.is_local)
+            or (api_base and ("127.0.0.1" in api_base or "localhost" in api_base))
+        )
+        keep_alive = 90.0 if _is_local_endpoint else 0.0
+
         return OpenAICompatProvider(
             api_key=primary_key,
             api_keys=keys if len(keys) > 1 else None,
@@ -196,6 +203,7 @@ def _make_single_provider(config: Any, provider_name: str, model: str) -> Any:
             timeout=p.timeout if p else 60.0,
             spec=spec,
             token_provider=token_provider,
+            keep_alive_interval=keep_alive,
         )
 
 

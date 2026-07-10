@@ -676,6 +676,15 @@ def gateway(
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
+        # Also enable loguru debug output
+        from loguru import logger as _logger
+        _logger.remove()
+        _logger.add(
+            sys.stderr,
+            level="DEBUG",
+            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        )
+        _logger.enable("nanobot")
 
     if log_file:
         from loguru import logger as _logger

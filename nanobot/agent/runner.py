@@ -169,6 +169,10 @@ class AgentRunSpec:
     # gradual context growth that causes inference slowdown on resource-
     # constrained devices.
     max_input_tokens: int | None = None
+    # Unified context budget manager. When provided, the runner uses this
+    # for mid-loop context enforcement instead of the scattered tool result
+    # clearing and turn trimming logic.
+    budget_manager: Any | None = None
 
 
 @dataclass(slots=True)
@@ -251,29 +255,35 @@ class AgentRunner:
         stream_waiting_final_end = False
 
         for iteration in range(spec.max_iterations):
-            # Clear old tool results each iteration to prevent context overflow
-            # during long-running tasks, but only once prompt size actually needs it.
-            if spec.tool_result_clearing_keep is not None:
-                clear_old_tool_results(
-                    messages,
-                    keep_last=spec.tool_result_clearing_keep,
-                    provider=self.provider,
-                    model=spec.model,
-                    tools=spec.tools.get_definitions(),
-                    trigger_tokens=spec.tool_result_clear_trigger_tokens,
-                    target_tokens=spec.tool_result_clear_target_tokens,
-                )
+            # Mid-loop context enforcement
+            if iteration > 0:
+                if spec.budget_manager is not None:
+                    # Unified context model: use budget manager for all enforcement
+                    await spec.budget_manager.enforce_budget(messages)
+                else:
+                    # Legacy model: scattered trimming
+                    # Hard ceiling: drop the oldest assistant+tool turn pairs if the
+                    # accumulated context exceeds max_input_tokens.  Run this BEFORE
+                    # clear_old_tool_results so we don't waste effort clearing
+                    # messages that are about to be deleted.
+                    if spec.max_input_tokens and spec.max_input_tokens > 0:
+                        self._trim_context_to_budget(
+                            messages,
+                            spec=spec,
+                        )
 
-            # Hard ceiling: if the accumulated context (system prompt + history
-            # + tool results) exceeds max_input_tokens, drop the oldest
-            # assistant+tool pairs.  Without this, multi-turn cron jobs on
-            # resource-constrained devices gradually exceed the model's context
-            # window and time out.
-            if spec.max_input_tokens and spec.max_input_tokens > 0 and iteration > 0:
-                self._trim_context_to_budget(
-                    messages,
-                    spec=spec,
-                )
+                    # Clear old tool results each iteration to prevent context overflow
+                    # during long-running tasks, but only once prompt size actually needs it.
+                    if spec.tool_result_clearing_keep is not None:
+                        clear_old_tool_results(
+                            messages,
+                            keep_last=spec.tool_result_clearing_keep,
+                            provider=self.provider,
+                            model=spec.model,
+                            tools=spec.tools.get_definitions(),
+                            trigger_tokens=spec.tool_result_clear_trigger_tokens,
+                            target_tokens=spec.tool_result_clear_target_tokens,
+                        )
 
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
@@ -557,17 +567,19 @@ class AgentRunner:
                 i += 1
 
         # Drop oldest turns until we are within budget (keep at least 1 turn).
-        dropped = 0
-        for start, end in turns[:-1]:
-            # Remove messages[start:end+1] in-place.
+        # Iterate from the END so that deletions do not invalidate earlier indices.
+        droppable = list(reversed(turns[:-1]))
+        dropped_indices: list[tuple[int, int]] = []
+        for start, end in droppable:
             del messages[start:end + 1]
-            dropped += 1
+            dropped_indices.append((start, end))
             tokens, _ = estimate_prompt_tokens_chain(
                 self.provider, spec.model, messages, tool_defs,
             )
             if tokens <= max_tokens:
                 break
 
+        dropped = len(dropped_indices)
         if dropped:
             logger.info(
                 "Mid-loop context trim: dropped {} old turn(s) to reach {} tokens (budget {})",
