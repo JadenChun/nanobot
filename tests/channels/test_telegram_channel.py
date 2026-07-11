@@ -1,5 +1,3 @@
-import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,8 +11,13 @@ except ImportError:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
-from nanobot.channels.telegram import TelegramConfig
+from nanobot.channels.telegram import (
+    TELEGRAM_MAX_CAPTION_LEN,
+    TELEGRAM_REPLY_CONTEXT_MAX_LEN,
+    TelegramChannel,
+    TelegramConfig,
+    _StreamBuf,
+)
 
 
 class _FakeHTTPXRequest:
@@ -190,6 +193,11 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert builder.request_value is api_req
     assert builder.get_updates_request_value is poll_req
     assert any(cmd.command == "status" for cmd in app.bot.commands)
+    assert any(
+        getattr(handler, "callback", None) == channel._forward_command
+        and handler.__class__.__name__ == "MessageHandler"
+        for handler in app.handlers
+    )
 
 
 @pytest.mark.asyncio
@@ -498,6 +506,23 @@ def test_telegram_group_policy_defaults_to_mention() -> None:
     assert TelegramConfig().group_policy == "mention"
 
 
+def test_telegram_config_accepts_camel_case_allow_chats() -> None:
+    config = TelegramConfig.model_validate({"allowChats": ["-100123"]})
+
+    assert config.allow_chats == ["-100123"]
+
+
+def test_chat_allowlist_only_restricts_non_private_chats() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(allow_from=["*"], allow_chats=["-100123"]),
+        MessageBus(),
+    )
+
+    assert channel.is_chat_allowed("-100123", "supergroup") is True
+    assert channel.is_chat_allowed("-100999", "group") is False
+    assert channel.is_chat_allowed("12345", "private") is True
+
+
 def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     channel = TelegramChannel(TelegramConfig(allow_from=["12345", "alice", "67890|bob"]), MessageBus())
 
@@ -597,9 +622,61 @@ async def test_send_remote_media_url_after_security_validation(monkeypatch) -> N
             "kind": "photo",
             "chat_id": 123,
             "photo": "https://example.com/cat.jpg",
+            "caption": "Attached file.",
+            "parse_mode": "HTML",
             "reply_parameters": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_media_uses_short_content_as_caption(tmp_path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nDetails", encoding="utf-8")
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Done - full report attached.",
+            media=[str(report)],
+        )
+    )
+
+    assert channel._app.bot.sent_messages == []
+    assert channel._app.bot.sent_media[0]["kind"] == "document"
+    assert channel._app.bot.sent_media[0]["caption"] == "Done - full report attached."
+    assert channel._app.bot.sent_media[0]["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_send_media_sends_long_content_as_text_before_attachment(tmp_path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    report = tmp_path / "report.md"
+    report.write_text("# Report\n\nDetails", encoding="utf-8")
+    long_content = "x" * (TELEGRAM_MAX_CAPTION_LEN + 1)
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content=long_content,
+            media=[str(report)],
+        )
+    )
+
+    assert channel._app.bot.sent_messages[0]["text"] == long_content
+    assert channel._app.bot.sent_media[0]["kind"] == "document"
+    assert "caption" not in channel._app.bot.sent_media[0]
 
 
 @pytest.mark.asyncio
@@ -653,6 +730,62 @@ async def test_group_policy_mention_ignores_unmentioned_group_message() -> None:
 
     assert handled == []
     assert channel._app.bot.get_me_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_group_chat_allowlist_rejects_unapproved_group_before_policy_check() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            allow_chats=["-100999"],
+            group_policy="open",
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    await channel._on_message(_make_telegram_update(text="hello group"), None)
+
+    assert handled == []
+    assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_private_chat_is_allowed_when_group_allowlist_is_configured() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["12345"],
+            allow_chats=["-100999"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+    channel._add_reaction = AsyncMock()
+
+    await channel._on_message(
+        _make_telegram_update(text="hello privately", chat_type="private"),
+        None,
+    )
+
+    assert len(handled) == 1
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1182,69 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/new"
+
+
+@pytest.mark.asyncio
+async def test_forward_command_rejects_unapproved_group_chat() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            allow_chats=["-100999"],
+            group_policy="open",
+        ),
+        MessageBus(),
+    )
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    await channel._forward_command(_make_telegram_update(text="/weekly_review"), None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_forward_command_runs_configured_fast_command(monkeypatch) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            fast_commands={"/connection_status": ["python3", "scripts/check_social_connection.py"]},
+            fast_command_workdir="/workspace",
+            fast_command_timeout=15,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    def fake_run(command, **kwargs):
+        assert command == ["python3", "scripts/check_social_connection.py"]
+        assert kwargs["cwd"] == "/workspace"
+        assert kwargs["timeout"] == 15
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=0, stdout="Social connection status:\n- Meta: connected\n", stderr="")
+
+    channel._handle_message = capture_handle
+    monkeypatch.setattr("nanobot.channels.telegram.subprocess.run", fake_run)
+
+    await channel._forward_command(_make_telegram_update(text="/connection_status@nanobot_test"), None)
+
+    assert handled == []
+    assert channel._app.bot.sent_messages
+    assert "Social connection status" in channel._app.bot.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio

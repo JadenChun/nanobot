@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import subprocess
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
@@ -25,6 +27,7 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_MAX_CAPTION_LEN = 1000  # Telegram caption limit is 1024; keep margin for HTML conversion
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
 
 
@@ -172,6 +175,7 @@ class TelegramConfig(Base):
     enabled: bool = False
     token: str = ""
     allow_from: list[str] = Field(default_factory=list)
+    allow_chats: list[str] = Field(default_factory=list)
     proxy: str | None = None
     reply_to_message: bool = False
     react_emoji: str = "👀"
@@ -179,6 +183,9 @@ class TelegramConfig(Base):
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
+    fast_commands: dict[str, list[str]] = Field(default_factory=dict)
+    fast_command_workdir: str = ""
+    fast_command_timeout: int = 120
 
 
 class TelegramChannel(BaseChannel):
@@ -241,6 +248,27 @@ class TelegramChannel(BaseChannel):
 
         return sid in allow_list or username in allow_list
 
+    def is_chat_allowed(self, chat_id: str | int, chat_type: str) -> bool:
+        """Allow private chats and optionally restrict group/supergroup chat IDs."""
+        if chat_type == "private":
+            return True
+
+        allow_list = self.config.allow_chats
+        if not allow_list or "*" in allow_list:
+            return True
+        return str(chat_id) in allow_list
+
+    def _is_update_allowed(self, message, user) -> bool:
+        """Reject unauthorized users and group chats before doing message work."""
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            logger.warning("Telegram access denied for sender {}", sender_id)
+            return False
+        if not self.is_chat_allowed(message.chat_id, message.chat.type):
+            logger.warning("Telegram access denied for chat {}", message.chat_id)
+            return False
+        return True
+
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
@@ -282,6 +310,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
+        self._app.add_handler(MessageHandler(filters.COMMAND, self._forward_command))
 
         # Add message handler for text, photos, voice, video, documents
         self._app.add_handler(
@@ -388,8 +417,24 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
+        content = msg.content if msg.content and msg.content != "[empty message]" else ""
+        media_paths = list(msg.media or [])
+        caption_html = ""
+        if content and media_paths:
+            candidate_caption = _markdown_to_telegram_html(content)
+            if len(candidate_caption) <= TELEGRAM_MAX_CAPTION_LEN:
+                caption_html = candidate_caption
+        elif media_paths:
+            caption_html = "Attached file."
+
+        # Long summaries cannot be captions, so send the text before files to
+        # avoid a blank-looking attachment message in Telegram exports.
+        if content and not caption_html:
+            for chunk in split_message(content, TELEGRAM_MAX_MESSAGE_LEN):
+                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+
         # Send media files
-        for media_path in (msg.media or []):
+        for index, media_path in enumerate(media_paths):
             try:
                 media_type = self._get_media_type(media_path)
                 sender = {
@@ -398,6 +443,12 @@ class TelegramChannel(BaseChannel):
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
                 param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                caption_kwargs = {}
+                if index == 0 and caption_html:
+                    caption_kwargs = {
+                        "caption": caption_html,
+                        "parse_mode": "HTML",
+                    }
 
                 # Telegram Bot API accepts HTTP(S) URLs directly for media params.
                 if self._is_remote_media_url(media_path):
@@ -408,6 +459,7 @@ class TelegramChannel(BaseChannel):
                         sender,
                         chat_id=chat_id,
                         **{param: media_path},
+                        **caption_kwargs,
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
@@ -417,6 +469,7 @@ class TelegramChannel(BaseChannel):
                     await sender(
                         chat_id=chat_id,
                         **{param: f},
+                        **caption_kwargs,
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
@@ -429,11 +482,6 @@ class TelegramChannel(BaseChannel):
                     reply_parameters=reply_params,
                     **thread_kwargs,
                 )
-
-        # Send text content
-        if msg.content and msg.content != "[empty message]":
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
     async def _call_with_retry(self, fn, *args, **kwargs):
         """Call an async Telegram API function with retry on pool/network timeout."""
@@ -678,6 +726,8 @@ class TelegramChannel(BaseChannel):
         """Handle /start command."""
         if not update.message or not update.effective_user:
             return
+        if not self._is_update_allowed(update.message, update.effective_user):
+            return
 
         user = update.effective_user
         await update.message.reply_text(
@@ -687,8 +737,10 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command, bypassing ACL so all users can access it."""
-        if not update.message:
+        """Handle /help command for authorized users and chats."""
+        if not update.message or not update.effective_user:
+            return
+        if not self._is_update_allowed(update.message, update.effective_user):
             return
         await update.message.reply_text(
             "🐈 nanobot commands:\n"
@@ -867,13 +919,71 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    @staticmethod
+    def _normalize_command(text: str | None) -> str:
+        """Return a normalized slash command such as /status or /cmd."""
+        if not text:
+            return ""
+        head = text.strip().split(maxsplit=1)[0]
+        if not head.startswith("/"):
+            return ""
+        return "/" + head[1:].split("@", 1)[0].lower()
+
+    async def _try_fast_command(self, message) -> bool:
+        """Run configured exact slash-command shortcuts without invoking the agent."""
+        command_name = self._normalize_command(getattr(message, "text", None))
+        command = self.config.fast_commands.get(command_name)
+        if not command:
+            return False
+        if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+            logger.warning("Ignoring invalid fast command config for {}", command_name)
+            return False
+
+        logger.info("Running Telegram fast command {}", command_name)
+        result = await asyncio.to_thread(
+            subprocess.run,
+            command,
+            cwd=self.config.fast_command_workdir or None,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=self.config.fast_command_timeout,
+            check=False,
+        )
+        output = (result.stdout or "").strip()
+        error_output = (result.stderr or "").strip()
+        if result.returncode != 0:
+            output = error_output or output or f"{command_name} failed with exit code {result.returncode}."
+        elif error_output:
+            logger.debug("Fast command {} stderr: {}", command_name, error_output[:500])
+        if not output:
+            output = f"{command_name} completed."
+
+        reply_params = None
+        if self.config.reply_to_message:
+            reply_params = ReplyParameters(
+                message_id=message.message_id,
+                allow_sending_without_reply=True,
+            )
+        thread_kwargs = {}
+        message_thread_id = getattr(message, "message_thread_id", None)
+        if message_thread_id is not None:
+            thread_kwargs["message_thread_id"] = message_thread_id
+        for chunk in split_message(output, TELEGRAM_MAX_MESSAGE_LEN):
+            await self._send_text(int(message.chat_id), chunk, reply_params, thread_kwargs)
+        return True
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
         message = update.message
         user = update.effective_user
+        if not self._is_update_allowed(message, user):
+            return
         self._remember_thread_context(message)
+        if await self._try_fast_command(message):
+            return
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
@@ -889,6 +999,8 @@ class TelegramChannel(BaseChannel):
 
         message = update.message
         user = update.effective_user
+        if not self._is_update_allowed(message, user):
+            return
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
@@ -1026,7 +1138,7 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         from telegram.error import NetworkError, TimedOut
-        
+
         if isinstance(context.error, (NetworkError, TimedOut)):
             logger.warning("Telegram network issue: {}", str(context.error))
         else:

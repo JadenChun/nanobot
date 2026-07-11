@@ -1,0 +1,64 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/opt/marketing-agent/.nanobot/workspace",
+      "model": "anthropic/claude-opus-4-5",
+      "provider": "auto",
+      "timezone": "Asia/Kuala_Lumpur",
+      "planningMode": "agent",
+      "maxTokens": {
+        "input": 120000,
+        "output": 4096
+      },
+      "contextRepos": [
+        {
+          "path": "/opt/marketing-agent/client-marketing-assistance",
+          "readOnly": false,
+          "autoSync": false
+        }
+      ]
+    }
+  },
+  "channels": {
+    "taskUpdateMode": "result",
+    "sendToolHints": false,
+    "telegram": {
+      "enabled": true,
+      "token": "",
+      "allowFrom": [],
+      "allowChats": [],
+      "replyToMessage": true,
+      "groupPolicy": "mention",
+      "streaming": true,
+      "fastCommandWorkdir": "/opt/marketing-agent/client-marketing-assistance",
+      "fastCommandTimeout": 120,
+      "fastCommands": {
+        "/connection_status": ["python3", "scripts/check_social_connection.py"],
+        "/connect_meta": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "meta"],
+        "/connect_tiktok": ["python3", "scripts/create_oauth_connect_link.py", "--platform", "tiktok"],
+        "/sync_meta_analytics": ["python3", "tools/meta_analytics.py", "sync", "--mode", "daily"]
+      }
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "apiKey": ""
+    },
+    "openrouter": {
+      "apiKey": "",
+      "timeout": 120
+    }
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18790
+  },
+  "tools": {
+    "restrictToWorkspace": false,
+    "exec": {
+      "enable": true,
+      "timeout": 120,
+      "pathAppend": "/opt/marketing-agent/client-marketing-assistance/scripts"
+    }
+  }
+}
