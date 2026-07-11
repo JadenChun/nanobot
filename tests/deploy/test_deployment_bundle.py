@@ -42,6 +42,7 @@ def test_nanobot_deploy_script_supports_checkout_as_install_directory() -> None:
 def test_nanobot_update_script_skips_unchanged_running_service() -> None:
     script = _read("deploy/scripts/update_nanobot_gateway.sh")
 
+    assert 'NANOBOT_BRANCH="${MARKETING_AGENT_NANOBOT_BRANCH:-main}"' in script
     assert 'before_head="$(run_as_deploy_user git -C "${NANOBOT_DIR}" rev-parse HEAD)"' in script
     assert 'after_head="$(run_as_deploy_user git -C "${NANOBOT_DIR}" rev-parse HEAD)"' in script
     assert "systemctl is-active --quiet nanobot-gateway" in script
