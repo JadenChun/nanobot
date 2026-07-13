@@ -757,6 +757,36 @@ async def test_group_policy_mention_ignores_unmentioned_group_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_update_logs_chat_identity_before_access_checks(monkeypatch) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["99999"],
+            group_policy="mention",
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    info_logs: list[tuple[str, tuple]] = []
+
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.info",
+        lambda message, *args: info_logs.append((message, args)),
+    )
+
+    await channel._on_message(_make_telegram_update(text="private campaign details"), None)
+
+    assert info_logs == [
+        (
+            "Telegram group update received: chat_id={} chat_type={} sender_user_id={}",
+            (-100123, "group", 12345),
+        )
+    ]
+    assert "private campaign details" not in repr(info_logs)
+
+
+@pytest.mark.asyncio
 async def test_group_chat_allowlist_rejects_unapproved_group_before_policy_check() -> None:
     channel = TelegramChannel(
         TelegramConfig(

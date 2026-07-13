@@ -767,6 +767,17 @@ class TelegramChannel(BaseChannel):
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
     @staticmethod
+    def _log_group_update_identity(message, user) -> None:
+        """Log non-sensitive group routing metadata before access checks."""
+        if message.chat.type != "private":
+            logger.info(
+                "Telegram group update received: chat_id={} chat_type={} sender_user_id={}",
+                message.chat_id,
+                message.chat.type,
+                user.id,
+            )
+
+    @staticmethod
     def _build_message_metadata(message, user) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
@@ -980,6 +991,7 @@ class TelegramChannel(BaseChannel):
             return
         message = update.message
         user = update.effective_user
+        self._log_group_update_identity(message, user)
         if not self._is_update_allowed(message, user):
             return
         self._remember_thread_context(message)
@@ -1000,6 +1012,7 @@ class TelegramChannel(BaseChannel):
 
         message = update.message
         user = update.effective_user
+        self._log_group_update_identity(message, user)
         if not self._is_update_allowed(message, user):
             return
         chat_id = message.chat_id
