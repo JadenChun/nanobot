@@ -35,8 +35,10 @@ class _FakeHTTPXRequest:
 class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
+        self.start_polling_kwargs: dict = {}
 
     async def start_polling(self, **kwargs) -> None:
+        self.start_polling_kwargs = kwargs
         self._on_start_polling()
 
 
@@ -192,6 +194,7 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert poll_req.kwargs["connection_pool_size"] == 4
     assert builder.request_value is api_req
     assert builder.get_updates_request_value is poll_req
+    assert app.updater.start_polling_kwargs["error_callback"] == channel._on_polling_error
     assert any(cmd.command == "status" for cmd in app.bot.commands)
     assert any(
         getattr(handler, "callback", None) == channel._forward_command
@@ -315,6 +318,27 @@ async def test_on_error_logs_network_issues_as_warning(monkeypatch) -> None:
     await channel._on_error(object(), SimpleNamespace(error=NetworkError("proxy disconnected")))
 
     assert recorded == [("warning", "Telegram network issue: proxy disconnected")]
+
+
+def test_on_polling_error_logs_network_issue_as_warning(monkeypatch) -> None:
+    from telegram.error import NetworkError
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    recorded: list[str] = []
+
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.warning",
+        lambda message, error_type, error: recorded.append(message.format(error_type, error)),
+    )
+
+    channel._on_polling_error(NetworkError("httpx.ReadError:"))
+
+    assert recorded == [
+        "Telegram polling issue (will retry): NetworkError: httpx.ReadError:"
+    ]
 
 
 @pytest.mark.asyncio

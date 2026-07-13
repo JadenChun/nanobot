@@ -14,7 +14,7 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -342,7 +342,8 @@ class TelegramChannel(BaseChannel):
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=True,  # Ignore old messages on startup
+            error_callback=self._on_polling_error,
         )
 
         # Keep running until stopped
@@ -1136,13 +1137,22 @@ class TelegramChannel(BaseChannel):
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Log polling / handler errors instead of silently swallowing them."""
+        """Log update-handler errors instead of silently swallowing them."""
         from telegram.error import NetworkError, TimedOut
 
         if isinstance(context.error, (NetworkError, TimedOut)):
             logger.warning("Telegram network issue: {}", str(context.error))
         else:
             logger.error("Telegram error: {}", context.error)
+
+    @staticmethod
+    def _on_polling_error(error: TelegramError) -> None:
+        """Log recoverable polling failures without the library's full traceback."""
+        logger.warning(
+            "Telegram polling issue (will retry): {}: {}",
+            type(error).__name__,
+            error,
+        )
 
     def _get_extension(
         self,
