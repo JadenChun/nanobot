@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJobState, CronSchedule
+from nanobot.cron.types import CronDestination, CronJobState, CronSchedule
 
 
 def _make_tool(tmp_path) -> CronTool:
@@ -271,6 +271,46 @@ def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
     assert job.schedule.tz == "Asia/Shanghai"
+
+
+def test_add_cron_job_accepts_additional_destinations(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Kuala_Lumpur")
+    tool.set_context("telegram", "6344587670")
+
+    result = tool._add_job(
+        "Daily report",
+        None,
+        "0 8 * * *",
+        None,
+        None,
+        additional_destinations=[
+            {"channel": "telegram", "to": "-1001234567890"},
+        ],
+    )
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.delivery_destinations() == [
+        CronDestination(channel="telegram", to="6344587670"),
+        CronDestination(channel="telegram", to="-1001234567890"),
+    ]
+    assert "telegram:6344587670, telegram:-1001234567890" in tool._list_jobs()
+
+
+def test_add_cron_job_rejects_invalid_additional_destination(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "6344587670")
+
+    result = tool._add_job(
+        "Daily report",
+        60,
+        None,
+        None,
+        None,
+        additional_destinations=[{"channel": "telegram", "to": ""}],
+    )
+
+    assert result == "Error: each additional destination requires channel and to"
 
 
 def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:

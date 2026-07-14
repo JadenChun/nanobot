@@ -50,6 +50,32 @@ Required values:
 - `OAUTH_BROKER_INTERNAL_API_KEY` in `nanobot.env`; it must match the OAuth
   broker's internal API key.
 
+## Multiple Cron Destinations
+
+Cron jobs keep `payload.channel` and `payload.to` as their primary execution
+and delivery context. To deliver the same completed result to other chats
+without running the workflow again, add `additionalDestinations` to the job in
+`/opt/marketing-agent/.nanobot/workspace/cron/jobs.json`:
+
+```json
+{
+  "payload": {
+    "deliver": true,
+    "channel": "telegram",
+    "to": "PRIMARY_DM_CHAT_ID",
+    "additionalDestinations": [
+      {
+        "channel": "telegram",
+        "to": "GROUP_CHAT_ID"
+      }
+    ]
+  }
+}
+```
+
+Each destination is de-duplicated before delivery. Telegram groups must still
+be approved through `channels.telegram.allowChats` in `config.json`.
+
 For low-latency marketing operations, the example config maps common Telegram
 slash commands such as `/connection_status` and `/sync_meta_analytics` directly
 to context-repo scripts. Commands not listed in `fastCommands` still go through

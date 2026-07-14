@@ -45,6 +45,8 @@ class TestMessageToolSuppressLogic:
         result = await loop._process_message(msg)
 
         assert len(sent) == 1
+        assert isinstance(mt, MessageTool)
+        assert mt.sent_messages_in_turn == tuple(sent)
         assert result is None  # suppressed
 
     @pytest.mark.asyncio
@@ -128,5 +130,7 @@ class TestMessageToolTurnTracking:
     def test_start_turn_resets(self) -> None:
         tool = MessageTool()
         tool._sent_in_turn = True
+        tool._sent_messages_in_turn = [OutboundMessage("feishu", "chat1", "done")]
         tool.start_turn()
         assert not tool._sent_in_turn
+        assert tool.sent_messages_in_turn == ()

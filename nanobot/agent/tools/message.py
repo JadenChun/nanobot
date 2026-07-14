@@ -21,6 +21,7 @@ class MessageTool(Tool):
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self._sent_messages_in_turn: list[OutboundMessage] = []
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -35,6 +36,12 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+        self._sent_messages_in_turn = []
+
+    @property
+    def sent_messages_in_turn(self) -> tuple[OutboundMessage, ...]:
+        """Return messages successfully sent during the current agent turn."""
+        return tuple(self._sent_messages_in_turn)
 
     @property
     def name(self) -> str:
@@ -106,6 +113,7 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
+            self._sent_messages_in_turn.append(msg)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""

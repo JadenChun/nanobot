@@ -4,7 +4,7 @@ import json
 import pytest
 
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronSchedule
+from nanobot.cron.types import CronDestination, CronSchedule
 
 
 def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
@@ -31,6 +31,57 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
 
     assert job.schedule.tz == "America/Vancouver"
     assert job.state.next_run_at_ms is not None
+
+
+def test_additional_destinations_are_persisted_and_loaded(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    job = service.add_job(
+        name="multi-target",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="Asia/Kuala_Lumpur"),
+        message="Send the report",
+        deliver=True,
+        channel="telegram",
+        to="6344587670",
+        additional_destinations=[
+            CronDestination(channel="telegram", to="-1001234567890"),
+        ],
+    )
+
+    raw = json.loads(store_path.read_text(encoding="utf-8"))
+    assert raw["jobs"][0]["payload"]["additionalDestinations"] == [
+        {"channel": "telegram", "to": "-1001234567890"},
+    ]
+
+    loaded = CronService(store_path).get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.delivery_destinations() == [
+        CronDestination(channel="telegram", to="6344587670"),
+        CronDestination(channel="telegram", to="-1001234567890"),
+    ]
+
+
+def test_legacy_job_without_additional_destinations_still_loads(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    job = service.add_job(
+        name="legacy",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        deliver=True,
+        channel="telegram",
+        to="6344587670",
+    )
+    raw = json.loads(store_path.read_text(encoding="utf-8"))
+    raw["jobs"][0]["payload"].pop("additionalDestinations")
+    store_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = CronService(store_path).get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.delivery_destinations() == [
+        CronDestination(channel="telegram", to="6344587670"),
+    ]
 
 
 @pytest.mark.asyncio
