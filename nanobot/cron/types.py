@@ -18,6 +18,14 @@ class CronSchedule:
     tz: str | None = None
 
 
+@dataclass(frozen=True)
+class CronDestination:
+    """One channel/chat destination for a cron result."""
+
+    channel: str
+    to: str
+
+
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
@@ -27,9 +35,31 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # Additional result destinations. channel/to remains the execution context.
+    additional_destinations: list[CronDestination] = field(default_factory=list)
     # Per-job overrides for the agent loop
     planning_mode: Literal["on", "off", "agent"] | None = None  # None = use global default
     skip_verification: bool = False
+
+    def delivery_destinations(self) -> list[CronDestination]:
+        """Return de-duplicated primary and additional result destinations."""
+        if not self.deliver:
+            return []
+
+        destinations: list[CronDestination] = []
+        if self.to:
+            destinations.append(CronDestination(channel=self.channel or "cli", to=str(self.to)))
+        destinations.extend(self.additional_destinations)
+
+        unique: list[CronDestination] = []
+        seen: set[tuple[str, str]] = set()
+        for destination in destinations:
+            key = (destination.channel, destination.to)
+            if not destination.channel or not destination.to or key in seen:
+                continue
+            seen.add(key)
+            unique.append(destination)
+        return unique
 
 
 @dataclass

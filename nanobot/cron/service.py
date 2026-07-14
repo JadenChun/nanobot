@@ -10,7 +10,15 @@ from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+from nanobot.cron.types import (
+    CronDestination,
+    CronJob,
+    CronJobState,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+    CronStore,
+)
 
 
 def _now_ms() -> int:
@@ -109,6 +117,19 @@ class CronService:
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
+                            additional_destinations=[
+                                CronDestination(
+                                    channel=str(destination["channel"]),
+                                    to=str(destination["to"]),
+                                )
+                                for destination in j["payload"].get(
+                                    "additionalDestinations",
+                                    j["payload"].get("additional_destinations", []),
+                                ) or []
+                                if isinstance(destination, dict)
+                                and destination.get("channel")
+                                and destination.get("to")
+                            ],
                             planning_mode=j["payload"].get("planning_mode"),
                             skip_verification=j["payload"].get("skip_verification", False),
                         ),
@@ -167,6 +188,10 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
+                        "additionalDestinations": [
+                            {"channel": destination.channel, "to": destination.to}
+                            for destination in j.payload.additional_destinations
+                        ],
                         "planning_mode": j.payload.planning_mode,
                         "skip_verification": j.payload.skip_verification,
                     },
@@ -195,7 +220,7 @@ class CronService:
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         self._last_mtime = self.store_path.stat().st_mtime
-    
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
@@ -326,6 +351,7 @@ class CronService:
         delete_after_run: bool = False,
         planning_mode: str | None = None,
         skip_verification: bool = False,
+        additional_destinations: list[CronDestination] | None = None,
     ) -> CronJob:
         """Add a new job."""
         store = self._load_store()
@@ -343,6 +369,7 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
+                additional_destinations=list(additional_destinations or []),
                 planning_mode=planning_mode,
                 skip_verification=skip_verification,
             ),

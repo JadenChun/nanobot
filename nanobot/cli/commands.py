@@ -743,7 +743,10 @@ def gateway(
         """Execute a cron job through the agent."""
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.message import MessageTool
+        from nanobot.cron.delivery import build_explicit_fanout_messages, build_result_messages
         from nanobot.utils.evaluator import evaluate_response
+
+        delivery_destinations = job.payload.delivery_destinations()
 
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
@@ -797,20 +800,30 @@ def gateway(
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+            for outbound in build_explicit_fanout_messages(
+                delivery_destinations,
+                message_tool.sent_messages_in_turn,
+            ):
+                await bus.publish_outbound(outbound)
             return response
 
-        if job.payload.deliver and job.payload.to and response:
+        if delivery_destinations and response:
             try:
                 should_notify = await evaluate_response(
                     response, job.payload.message, provider, agent.model,
                 )
                 if should_notify:
-                    from nanobot.bus.events import OutboundMessage
-                    await bus.publish_outbound(OutboundMessage(
-                        channel=job.payload.channel or "cli",
-                        chat_id=job.payload.to,
-                        content=response,
-                    ))
+                    sent_messages = (
+                        message_tool.sent_messages_in_turn
+                        if isinstance(message_tool, MessageTool)
+                        else ()
+                    )
+                    for outbound in build_result_messages(
+                        response,
+                        delivery_destinations,
+                        sent_messages,
+                    ):
+                        await bus.publish_outbound(outbound)
             except Exception as exc:
                 agent.record_task_failure(
                     session_key=f"cron:{job.id}",

@@ -6,7 +6,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJobState, CronSchedule
+from nanobot.cron.types import CronDestination, CronJobState, CronSchedule
 
 
 class CronTool(Tool):
@@ -106,6 +106,21 @@ class CronTool(Tool):
                     "type": "boolean",
                     "description": "Skip the verification phase after action execution. Default: false.",
                 },
+                "additional_destinations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string"},
+                            "to": {"type": "string"},
+                        },
+                        "required": ["channel", "to"],
+                    },
+                    "description": (
+                        "Optional additional result destinations. The current chat remains the "
+                        "primary destination."
+                    ),
+                },
                 "job_id": {"type": "string", "description": "Job ID (for remove)"},
             },
             "required": ["action"],
@@ -122,12 +137,22 @@ class CronTool(Tool):
         job_id: str | None = None,
         planning_mode: str | None = None,
         skip_verification: bool = False,
+        additional_destinations: list[dict[str, str]] | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(message, every_seconds, cron_expr, tz, at, planning_mode, skip_verification)
+            return self._add_job(
+                message,
+                every_seconds,
+                cron_expr,
+                tz,
+                at,
+                planning_mode,
+                skip_verification,
+                additional_destinations,
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -143,6 +168,7 @@ class CronTool(Tool):
         at: str | None,
         planning_mode: str | None = None,
         skip_verification: bool = False,
+        additional_destinations: list[dict[str, str]] | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -180,6 +206,16 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        destinations: list[CronDestination] = []
+        for destination in additional_destinations or []:
+            if not isinstance(destination, dict):
+                return "Error: each additional destination must be an object"
+            channel = str(destination.get("channel") or "").strip()
+            target = str(destination.get("to") or "").strip()
+            if not channel or not target:
+                return "Error: each additional destination requires channel and to"
+            destinations.append(CronDestination(channel=channel, to=target))
+
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
@@ -187,6 +223,7 @@ class CronTool(Tool):
             deliver=True,
             channel=self._channel,
             to=self._chat_id,
+            additional_destinations=destinations,
             delete_after_run=delete_after,
             planning_mode=planning_mode,
             skip_verification=skip_verification,
@@ -235,6 +272,13 @@ class CronTool(Tool):
         for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]
+            destinations = j.payload.delivery_destinations()
+            if destinations:
+                targets = ", ".join(
+                    f"{destination.channel}:{destination.to}"
+                    for destination in destinations
+                )
+                parts.append(f"  Deliver to: {targets}")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
