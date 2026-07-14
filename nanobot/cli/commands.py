@@ -676,6 +676,15 @@ def gateway(
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
+        # Also enable loguru debug output
+        from loguru import logger as _logger
+        _logger.remove()
+        _logger.add(
+            sys.stderr,
+            level="DEBUG",
+            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        )
+        _logger.enable("nanobot")
 
     if log_file:
         from loguru import logger as _logger
@@ -781,6 +790,7 @@ def gateway(
                     chat_id=job.payload.to or "direct",
                     planning_mode=job.payload.planning_mode,
                     skip_verification=job.payload.skip_verification,
+                    approval_granted=True,
                 )
             except Exception as exc:
                 agent.record_task_failure(

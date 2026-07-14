@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.policy import ToolPolicy, ToolPolicyDecision
 from nanobot.agent.tools.registry import ToolRegistry
@@ -161,6 +163,16 @@ class AgentRunSpec:
     tool_result_clear_trigger_tokens: int | None = None
     tool_result_clear_target_tokens: int | None = None
     tool_policy: ToolPolicy | None = None
+    # Hard ceiling on prompt tokens.  When set, the runner will trim the
+    # oldest conversation turns (assistant + tool pairs) at the top of each
+    # iteration to keep the context within budget.  This prevents the
+    # gradual context growth that causes inference slowdown on resource-
+    # constrained devices.
+    max_input_tokens: int | None = None
+    # Unified context budget manager. When provided, the runner uses this
+    # for mid-loop context enforcement instead of the scattered tool result
+    # clearing and turn trimming logic.
+    budget_manager: Any | None = None
 
 
 @dataclass(slots=True)
@@ -243,18 +255,35 @@ class AgentRunner:
         stream_waiting_final_end = False
 
         for iteration in range(spec.max_iterations):
-            # Clear old tool results each iteration to prevent context overflow
-            # during long-running tasks, but only once prompt size actually needs it.
-            if spec.tool_result_clearing_keep is not None:
-                clear_old_tool_results(
-                    messages,
-                    keep_last=spec.tool_result_clearing_keep,
-                    provider=self.provider,
-                    model=spec.model,
-                    tools=spec.tools.get_definitions(),
-                    trigger_tokens=spec.tool_result_clear_trigger_tokens,
-                    target_tokens=spec.tool_result_clear_target_tokens,
-                )
+            # Mid-loop context enforcement
+            if iteration > 0:
+                if spec.budget_manager is not None:
+                    # Unified context model: use budget manager for all enforcement
+                    await spec.budget_manager.enforce_budget(messages)
+                else:
+                    # Legacy model: scattered trimming
+                    # Hard ceiling: drop the oldest assistant+tool turn pairs if the
+                    # accumulated context exceeds max_input_tokens.  Run this BEFORE
+                    # clear_old_tool_results so we don't waste effort clearing
+                    # messages that are about to be deleted.
+                    if spec.max_input_tokens and spec.max_input_tokens > 0:
+                        self._trim_context_to_budget(
+                            messages,
+                            spec=spec,
+                        )
+
+                    # Clear old tool results each iteration to prevent context overflow
+                    # during long-running tasks, but only once prompt size actually needs it.
+                    if spec.tool_result_clearing_keep is not None:
+                        clear_old_tool_results(
+                            messages,
+                            keep_last=spec.tool_result_clearing_keep,
+                            provider=self.provider,
+                            model=spec.model,
+                            tools=spec.tools.get_definitions(),
+                            trigger_tokens=spec.tool_result_clear_trigger_tokens,
+                            target_tokens=spec.tool_result_clear_target_tokens,
+                        )
 
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
@@ -496,3 +525,63 @@ class AgentRunner:
             "status": status,
             "detail": detail,
         }, None
+
+    def _trim_context_to_budget(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        spec: AgentRunSpec,
+    ) -> None:
+        """Drop the oldest assistant+tool turn pairs to stay within *max_input_tokens*.
+
+        The system message and the first user message are never removed.
+        Assistant messages that contain tool_calls are kept together with
+        their subsequent tool-result messages so the conversation remains
+        well-formed for the LLM API.
+        """
+        max_tokens = spec.max_input_tokens
+        if not max_tokens:
+            return
+
+        tool_defs = spec.tools.get_definitions()
+        tokens, _ = estimate_prompt_tokens_chain(
+            self.provider, spec.model, messages, tool_defs,
+        )
+        if tokens <= max_tokens:
+            return
+
+        # Identify turn boundaries: an assistant message (possibly with
+        # tool_calls) followed by its tool results forms one "turn".
+        turns: list[tuple[int, int]] = []  # (start_idx, end_idx) inclusive
+        i = 1  # skip system message at index 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant":
+                start = i
+                i += 1
+                # Consume subsequent tool-result messages belonging to this turn.
+                while i < len(messages) and messages[i].get("role") == "tool":
+                    i += 1
+                turns.append((start, i - 1))
+            else:
+                i += 1
+
+        # Drop oldest turns until we are within budget (keep at least 1 turn).
+        # Iterate from the END so that deletions do not invalidate earlier indices.
+        droppable = list(reversed(turns[:-1]))
+        dropped_indices: list[tuple[int, int]] = []
+        for start, end in droppable:
+            del messages[start:end + 1]
+            dropped_indices.append((start, end))
+            tokens, _ = estimate_prompt_tokens_chain(
+                self.provider, spec.model, messages, tool_defs,
+            )
+            if tokens <= max_tokens:
+                break
+
+        dropped = len(dropped_indices)
+        if dropped:
+            logger.info(
+                "Mid-loop context trim: dropped {} old turn(s) to reach {} tokens (budget {})",
+                dropped, tokens, max_tokens,
+            )

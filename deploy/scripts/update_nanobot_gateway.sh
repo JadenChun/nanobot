@@ -4,7 +4,7 @@ set -euo pipefail
 BASE_DIR="${MARKETING_AGENT_BASE_DIR:-/opt/marketing-agent}"
 DEPLOY_USER="${MARKETING_AGENT_DEPLOY_USER:-marketing-agent}"
 NANOBOT_DIR="${MARKETING_AGENT_NANOBOT_DIR:-${BASE_DIR}/nanobot-custom}"
-NANOBOT_BRANCH="${MARKETING_AGENT_NANOBOT_BRANCH:-codex/marketing-agent-telegram-access}"
+NANOBOT_BRANCH="${MARKETING_AGENT_NANOBOT_BRANCH:-main}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root or with sudo." >&2

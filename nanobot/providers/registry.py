@@ -60,6 +60,12 @@ class ProviderSpec:
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
+    # Vision fallback model: when the primary model rejects image content,
+    # this model is used to describe the images so the primary model can
+    # proceed with text descriptions instead. Only set for providers whose
+    # model lineup includes non-vision models (e.g. OpenCode Go's DeepSeek).
+    vision_fallback_model: str | None = None
+
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False
 
@@ -218,6 +224,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://opencode.ai/zen/go/v1",
         strip_model_prefix=True,
+        vision_fallback_model="mimo-v2.5",
     ),
     # OpenAI Codex: OAuth-based, dedicated provider
     ProviderSpec(

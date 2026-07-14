@@ -196,6 +196,11 @@ class RiskyActionPolicy(ToolPolicy):
                 changed += max(i2 - i1, j2 - j1)
         return changed, total
 
+    # Files at or below this many lines are considered trivial state; a full
+    # rewrite is not "risky" because there is nothing of substance to lose.
+    # The absolute ``changed > 200`` guard still catches genuinely large edits.
+    _SMALL_FILE_LINE_THRESHOLD = 10
+
     def _is_agent_state_file(self, raw_path: str) -> bool:
         """Memory files the agent manages freely — no size checks."""
         p = Path(raw_path)
@@ -244,7 +249,11 @@ class RiskyActionPolicy(ToolPolicy):
         except Exception:
             return f"overwrite existing file {path.name}"
         changed, total = self._changed_line_count(old_content, new_content)
-        if changed > 200 or changed / total > 0.5:
+        if changed > 200:
+            return f"overwrite a large portion of {path.name}"
+        if total <= self._SMALL_FILE_LINE_THRESHOLD:
+            return None
+        if changed / total > 0.5:
             return f"overwrite a large portion of {path.name}"
         return None
 

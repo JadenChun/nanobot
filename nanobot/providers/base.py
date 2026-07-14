@@ -460,6 +460,25 @@ class LLMProvider(ABC):
                 result.append(msg)
         return result if found else None
 
+    async def _describe_images_via_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        reason: str = "vision",
+    ) -> list[dict[str, Any]] | None:
+        """Describe images via a vision-capable fallback model.
+
+        When the primary model rejects image content, subclasses can override
+        this to call a secondary vision model to describe each image, then
+        replace the ``image_url`` blocks with text descriptions so the primary
+        model can proceed with text-only context.
+
+        Returns modified messages with images replaced by text descriptions,
+        or ``None`` if no fallback is available / the fallback call failed
+        (caller should then fall back to :meth:`_strip_image_content`).
+        """
+        return None
+
     @classmethod
     def _prune_old_images(
         cls,
@@ -634,6 +653,18 @@ class LLMProvider(ABC):
             if not self._is_transient_response(response):
                 too_large = self._is_payload_too_large(response.content)
                 strip_reason = "payload_too_large" if too_large else "vision"
+                # Try vision fallback first: describe images via a
+                # vision-capable model so the primary model can proceed
+                # with text descriptions instead of being stripped blind.
+                described = await self._describe_images_via_fallback(messages, reason=strip_reason)
+                if described is not None:
+                    logger.info(
+                        "Provider {} (model={}) rejected image content; "
+                        "described images via vision fallback model, retrying "
+                        "with text descriptions.",
+                        type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                    )
+                    return await self._safe_chat_stream(**{**kw, "messages": described})
                 stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
                     if too_large:
@@ -710,6 +741,18 @@ class LLMProvider(ABC):
             if not self._is_transient_response(response):
                 too_large = self._is_payload_too_large(response.content)
                 strip_reason = "payload_too_large" if too_large else "vision"
+                # Try vision fallback first: describe images via a
+                # vision-capable model so the primary model can proceed
+                # with text descriptions instead of being stripped blind.
+                described = await self._describe_images_via_fallback(messages, reason=strip_reason)
+                if described is not None:
+                    logger.info(
+                        "Provider {} (model={}) rejected image content; "
+                        "described images via vision fallback model, retrying "
+                        "with text descriptions.",
+                        type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
+                    )
+                    return await self._safe_chat_stream(**{**kw, "messages": described})
                 stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
                     if too_large:

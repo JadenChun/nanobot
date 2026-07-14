@@ -149,8 +149,8 @@ def test_response_renderable_without_metadata_keeps_markdown_path():
 
 
 @pytest.mark.asyncio
-async def test_stream_renderer_reprints_full_buffer_after_live_stream():
-    """Live previews should be replaced with the full buffered response on stream end."""
+async def test_stream_renderer_keeps_live_content_without_reprint():
+    """Live content should stay on screen (transient=False) without reprinting."""
     mock_console = MagicMock()
     live_instances: list[object] = []
 
@@ -192,11 +192,18 @@ async def test_stream_renderer_reprints_full_buffer_after_live_stream():
     live = live_instances[0]
     assert live.started is True
     assert live.stopped is True
-    assert live.transient is True
-
+    # transient=False: content stays on screen, no clear-then-reprint cycle
+    assert live.transient is False
+    # The renderable passed to Live should contain the full content
+    assert isinstance(live.renderable, Text)
+    assert live.renderable.plain == "hello\nworld"
+    # No redundant update/refresh on the first delta (start() already rendered)
+    assert live.refreshed == 0
+    # The full content should NOT be reprinted via console.print —
+    # it's already visible from the Live display.
     rendered_texts = [
         args[0]
         for args, _ in mock_console.print.call_args_list
         if args and isinstance(args[0], Text)
     ]
-    assert any(text.plain == "hello\nworld" for text in rendered_texts)
+    assert not any(text.plain == "hello\nworld" for text in rendered_texts)

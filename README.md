@@ -361,10 +361,13 @@ tools:
   desktop_use:
     enabled: true
     # screenshot_delay: 0.5    # delay before capturing screenshot
-    # typing_delay_ms: 12      # delay between keystrokes
+    # typing_delay_ms: 12      # mean inter-key delay during `type` (ms)
     # scaling_enabled: true    # downscale to vision-model-friendly resolution
     # max_output_chars: 12000  # cap on text output length
+    # humanize_typing: true    # jittered human-like typing cadence
 ```
+
+With `humanize_typing: true` (the default), `typing_delay_ms` is treated as the **mean** of a log-normal distribution clamped to a realistic human band (~70–220 ms) rather than a fixed per-key interval. Common bigrams ("th", "he", "in", …) are typed ~45% faster (muscle memory), spaces and shifted/punctuation chars get a small penalty, and there's a ~4% chance of a 180–520 ms "thinking" pause folded into a keystroke. Set `humanize_typing: false` to restore the original constant-cadence behaviour.
 
 Notes:
 

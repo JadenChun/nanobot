@@ -15,10 +15,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.policy import RiskyActionPolicy
-from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec, clear_old_tool_results
+from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
@@ -95,14 +96,13 @@ class _LoopHook(AgentHook):
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         self._stream_buf += delta
+        if self._on_stream:
+            await self._on_stream(delta)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        if not resuming and self._on_stream:
-            from nanobot.utils.helpers import strip_think
-
-            final_clean = strip_think(self._stream_buf)
-            if final_clean:
-                await self._on_stream(final_clean)
+        # Deltas are forwarded live during streaming; no need to re-send the
+        # full buffer at the end (that would duplicate the content).
+        # Think-tag stripping is handled by the renderer's _render().
         if self._on_stream_end:
             await self._on_stream_end(resuming=resuming)
         self._stream_buf = ""
@@ -323,6 +323,29 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
+        
+        # Unified context budget management
+        # Always created when max_tokens.input is set. Handles all context reduction:
+        # - Compact old tool results
+        # - Drop old turn pairs
+        # - Compress memory ([Past Knowledge] message)
+        self.budget_manager: ContextBudgetManager | None = None
+        if self.max_tokens.input > 0:
+            self.budget_manager = ContextBudgetManager(
+                budget=ContextBudget(
+                    max_tokens=self.max_tokens.input,
+                    output_reserve=self.max_tokens.output,
+                ),
+                memory_store=self.context.memory,
+                provider=provider,
+                model=self.model,
+                tool_registry=self.tools,
+            )
+            logger.info(
+                "Context budget manager initialized: max_tokens={}, available_budget={}",
+                self.budget_manager.budget.max_tokens,
+                self.budget_manager.budget.available_budget,
+            )
         self._file_lock_registry = FileLockRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -446,6 +469,7 @@ class AgentLoop:
                 scaling_enabled=self.desktop_use_config.scaling_enabled,
                 max_output_chars=self.desktop_use_config.max_output_chars,
                 working_dir=str(self.workspace),
+                humanize_typing=self.desktop_use_config.humanize_typing,
             ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -1479,6 +1503,8 @@ End your response with exactly:
                 None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
             ),
             tool_policy=tool_policy,
+            max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
+            budget_manager=self.budget_manager,  # Pass unified budget manager for mid-loop enforcement
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -1532,6 +1558,7 @@ End your response with exactly:
         approval_granted: bool = False,
         planned: _PlanDecision | None = None,
         skip_verification: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> AgentRunResult:
         policy = RiskyActionPolicy(
             workspace=self.workspace,
@@ -1551,6 +1578,7 @@ End your response with exactly:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            tools=tools,
             tool_policy=policy,
             channel=channel,
             chat_id=chat_id,
@@ -1603,6 +1631,7 @@ End your response with exactly:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            tools=tools,
             tool_policy=RiskyActionPolicy(workspace=self.workspace, approval_granted=True),
             channel=channel,
             chat_id=chat_id,
@@ -1654,6 +1683,9 @@ End your response with exactly:
         self._running = True
         # Connect MCP servers in background so agent accepts messages immediately
         asyncio.create_task(self._connect_mcp())
+        # Start keep-alive ping for local providers (if configured)
+        if hasattr(self.provider, "start_keep_alive"):
+            self.provider.start_keep_alive()
         logger.info("Agent loop started")
 
         while self._running:
@@ -1812,7 +1844,7 @@ End your response with exactly:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
-        task.add_done_callback(self._background_tasks.remove)
+        task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -1821,6 +1853,9 @@ End your response with exactly:
 
     def cancel_active_tasks(self) -> None:
         """Cancel all active message processing and background tasks."""
+        # Stop keep-alive ping first
+        if hasattr(self.provider, "stop_keep_alive"):
+            self.provider.stop_keep_alive()
         for tasks in self._active_tasks.values():
             for task in tasks:
                 if not task.done():
@@ -1840,6 +1875,8 @@ End your response with exactly:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         planning_mode_override: str | None = None,
         skip_verification: bool = False,
+        approval_granted: bool = False,
+        tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1860,8 +1897,8 @@ End your response with exactly:
 
             if self.max_tokens.input > 0:
                 try:
-                    tools = self.tools.get_definitions()
-                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, tools)
+                    sys_tool_defs = self.tools.get_definitions()
+                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, sys_tool_defs)
                     if tokens > self.max_tokens.input:
                         logger.warning(
                             "System context size ({}) exceeds maxTokens.input ({}). Trimming oldest turns.",
@@ -1881,7 +1918,7 @@ End your response with exactly:
                                 self.provider,
                                 self.model,
                                 messages,
-                                tools,
+                                sys_tool_defs,
                             )
                 except Exception as e:
                     logger.error("Failed to check system token count: {}", e)
@@ -1950,59 +1987,28 @@ End your response with exactly:
         current_message = msg.content
         if approval_note:
             current_message = f"{approval_note}\n\nOriginal approval reply: {msg.content}"
+
+        # Use filtered tool set if provided, otherwise full set.
+        effective_tools = tools if tools is not None else self.tools
+        tool_names_set = set(effective_tools.tool_names) if tools is not None else None
+
+        # Unified context model: memory injected as [Past Knowledge] message
         initial_messages = self.context.build_messages(
             history=history,
             current_message=current_message,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            tool_names=tool_names_set,
+            inject_memory=True,
         )
-
-        tools = self.tools.get_definitions()
-        clear_trigger_tokens, clear_target_tokens = self._tool_result_clear_thresholds()
-
-        # Compact old tool results only when prompt size is approaching the budget.
-        clear_old_tool_results(
-            initial_messages,
-            keep_last=self.tool_result_clearing_keep,
-            provider=self.provider,
-            model=self.model,
-            tools=tools,
-            trigger_tokens=clear_trigger_tokens,
-            target_tokens=clear_target_tokens,
-        )
-
-        # Safety check: trim oldest turns if this specific request still exceeds maxTokens.input.
-        if self.max_tokens.input > 0:
-            try:
-                tokens, _ = estimate_prompt_tokens_chain(
-                    self.provider,
-                    self.model,
-                    initial_messages,
-                    tools,
-                )
-                if tokens > self.max_tokens.input:
-                    logger.warning(
-                        "Context size ({}) exceeds maxTokens.input ({}). Trimming oldest turns.",
-                        tokens,
-                        self.max_tokens.input,
-                    )
-                    while tokens > self.max_tokens.input and history:
-                        history.pop(0)
-                        initial_messages = self.context.build_messages(
-                            history=history,
-                            current_message=current_message,
-                            media=msg.media if msg.media else None,
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                        )
-                        tokens, _ = estimate_prompt_tokens_chain(
-                            self.provider,
-                            self.model,
-                            initial_messages,
-                            tools,
-                        )
-            except Exception as e:
-                logger.error("Failed to check token count: {}", e)
+        tool_defs = effective_tools.get_definitions()
+        
+        # Enforce budget using unified manager (handles all reduction strategies)
+        if self.budget_manager is not None:
+            initial_messages = await self.budget_manager.enforce_budget(
+                initial_messages,
+                preserve_last_n_turns=self.tool_result_clearing_keep,
+            )
 
         planned: _PlanDecision | None = None
         effective_planning_mode = planning_mode_override if planning_mode_override is not None else self.planning_mode
@@ -2079,9 +2085,10 @@ End your response with exactly:
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
-            approval_granted=approval_note is not None,
+            approval_granted=approval_granted or approval_note is not None,
             planned=planned,
             skip_verification=skip_verification,
+            tools=tools,
         )
         final_content = result.final_content
         all_msgs = result.messages
@@ -2112,7 +2119,7 @@ End your response with exactly:
             chat_id=msg.chat_id,
             task_text=current_message,
             response_text=final_content,
-            approval_granted=approval_note is not None,
+            approval_granted=approval_granted or approval_note is not None,
         )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -2269,13 +2276,24 @@ End your response with exactly:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         planning_mode: str | None = None,
         skip_verification: bool = False,
+        approval_granted: bool = False,
+        tool_names: list[str] | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        *tool_names*: optional whitelist of tool names to expose.  When set,
+        only the listed tools are available to the agent, which reduces the
+        system prompt token count — useful for lightweight scheduled tasks on
+        resource-constrained devices.
+        """
         await self._connect_mcp()
+        tools = self.tools.filtered(tool_names) if tool_names else None
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
             planning_mode_override=planning_mode,
             skip_verification=skip_verification,
+            approval_granted=approval_granted,
+            tools=tools,
         )

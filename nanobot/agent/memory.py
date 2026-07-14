@@ -113,13 +113,106 @@ class MemoryStore:
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
 
-    def append_history(self, entry: str) -> None:
+    def append_history(self, entry: str, source: str | None = None) -> None:
+        """Append an entry to HISTORY.md.
+        
+        Args:
+            entry: History entry (may include timestamp prefix)
+            source: Optional source tag (e.g., "cron", "chat") for filtering
+        """
+        # Add source tag if provided and entry doesn't already have one
+        if source and "[source=" not in entry:
+            # Try to insert source tag after timestamp if present
+            # Format: [YYYY-MM-DD HH:MM] content -> [YYYY-MM-DD HH:MM] [source=X] content
+            if entry.startswith("[") and "] " in entry:
+                bracket_end = entry.index("] ") + 2
+                entry = f"{entry[:bracket_end]}[source={source}] {entry[bracket_end:]}"
+            else:
+                entry = f"[source={source}] {entry}"
+        
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+    
+    async def compress_to_target(
+        self,
+        target_tokens: int,
+        provider: LLMProvider,
+        model: str,
+    ) -> str:
+        """Compress MEMORY.md to target token count.
+        
+        Uses LLM to compress memory while preserving key facts and recent events.
+        
+        Args:
+            target_tokens: Target token count for compressed memory
+            provider: LLM provider for compression
+            model: Model to use for compression
+            
+        Returns:
+            Compressed memory content (does not write to disk)
+        """
+        current = self.read_long_term()
+        if not current:
+            return ""
+        
+        # Rough token estimate (4 chars per token)
+        current_tokens = len(current) // 4
+        
+        if current_tokens <= target_tokens:
+            return current
+        
+        logger.info(
+            "Compressing memory from ~{} to ~{} tokens",
+            current_tokens,
+            target_tokens,
+        )
+        
+        prompt = f"""Compress this agent memory to ~{target_tokens} tokens.
+
+Preserve:
+- Key facts, decisions, and user preferences
+- Recent events and current task state
+- Important file names and paths
+- Errors and how they were resolved
+
+Remove:
+- Redundant details and verbose descriptions
+- Old events that are no longer relevant
+- Verbatim dialogue (keep summaries instead)
+
+Current memory:
+{current}
+
+Return compressed memory only (no explanation)."""
+        
+        try:
+            response = await provider.chat_with_retry(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                max_tokens=target_tokens + 200,
+            )
+            
+            compressed = response.content or ""
+            
+            logger.info(
+                "Compressed memory from {} to {} chars",
+                len(current),
+                len(compressed),
+            )
+            return compressed
+            
+        except Exception as e:
+            logger.error("Failed to compress memory: {}", e)
+            # Fallback: truncate to max tokens
+            max_chars = target_tokens * 4
+            if len(current) > max_chars:
+                truncated = current[:max_chars] + "\n\n[Truncated due to size]"
+                return truncated
+            return current
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
@@ -139,8 +232,17 @@ class MemoryStore:
         provider: LLMProvider,
         model: str,
         max_output_tokens: int | None = None,
+        source: str | None = None,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
+        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md.
+        
+        Args:
+            messages: Message list to consolidate
+            provider: LLM provider for consolidation
+            model: Model to use
+            max_output_tokens: Max tokens for output
+            source: Optional source tag for HISTORY.md entries (e.g., "cron", "chat")
+        """
         if not messages:
             return True
 
@@ -246,7 +348,7 @@ Call the save_memory tool with your consolidation.
                 logger.warning("Memory consolidation: history_entry is empty after normalization")
                 return self._fail_or_raw_archive(messages)
 
-            self.append_history(entry)
+            self.append_history(entry, source=source)
             update = _ensure_text(update)
             if update != current_memory:
                 self.write_long_term(update)

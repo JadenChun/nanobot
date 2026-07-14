@@ -175,6 +175,39 @@ def test_parse_chunks_dict_preserves_extra_content() -> None:
     assert payload["extra_content"] == GEMINI_EXTRA
 
 
+# ── _parse_chunks: reasoning_content accumulation (DeepSeek thinking mode) ──
+
+def test_parse_chunks_sdk_accumulates_reasoning_content() -> None:
+    """DeepSeek streaming sends reasoning_content in delta chunks; it must survive parse."""
+    delta1 = SimpleNamespace(content=None, reasoning_content="thinking ", tool_calls=None)
+    delta2 = SimpleNamespace(content=None, reasoning_content="about apps", tool_calls=None)
+    delta3 = SimpleNamespace(content="GitHub Desktop", reasoning_content=None, tool_calls=None)
+    chunks = [
+        SimpleNamespace(choices=[SimpleNamespace(finish_reason=None, delta=delta1)], usage=None),
+        SimpleNamespace(choices=[SimpleNamespace(finish_reason=None, delta=delta2)], usage=None),
+        SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", delta=delta3)], usage=None),
+    ]
+
+    result = OpenAICompatProvider._parse_chunks(chunks)
+
+    assert result.content == "GitHub Desktop"
+    assert result.reasoning_content == "thinking about apps"
+
+
+def test_parse_chunks_dict_accumulates_reasoning_content() -> None:
+    """Dict-path streaming chunks also accumulate reasoning_content."""
+    chunks = [
+        {"choices": [{"finish_reason": None, "delta": {"content": None, "reasoning_content": "step 1 "}}]},
+        {"choices": [{"finish_reason": None, "delta": {"content": None, "reasoning_content": "step 2"}}]},
+        {"choices": [{"finish_reason": "stop", "delta": {"content": "done", "reasoning_content": None}}]},
+    ]
+
+    result = OpenAICompatProvider._parse_chunks(chunks)
+
+    assert result.content == "done"
+    assert result.reasoning_content == "step 1 step 2"
+
+
 # ── Model switching: stale extras shouldn't break other providers ─────
 
 def test_stale_extra_content_in_tool_calls_survives_sanitize() -> None:

@@ -27,15 +27,36 @@ def _is_blocked(path: Path) -> bool:
     return path.name in _BLOCKED_FILENAMES
 
 
+# Docker-style alias: /workspace/... is transparently rewritten to the real
+# host workspace path so that models trained on container layouts still land
+# in the correct directory.
+_WORKSPACE_ALIAS_PREFIX = "/workspace/"
+_WORKSPACE_ALIAS_EXACT = "/workspace"
+
+
 def _resolve_path(
     path: str,
     workspace: Path | None = None,
     allowed_dir: Path | None = None,
     extra_allowed_dirs: list[Path] | None = None,
 ) -> Path:
-    """Resolve path against workspace (if relative) and enforce directory restriction."""
+    """Resolve path against workspace (if relative) and enforce directory restriction.
+
+    As a convenience for models that emit Docker-style absolute paths, any
+    path beginning with ``/workspace/`` is rewritten to the real host workspace
+    when one is configured.  This is a harmless no-op when the workspace is
+    already mounted at ``/workspace``.
+    """
     p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
+    if p.is_absolute() and workspace:
+        # Rewrite /workspace/... → {actual workspace}/...
+        p_str = str(p)
+        if p_str.startswith(_WORKSPACE_ALIAS_PREFIX):
+            relative = p_str[len(_WORKSPACE_ALIAS_PREFIX):]
+            p = workspace / relative if relative else workspace
+        elif p_str == _WORKSPACE_ALIAS_EXACT:
+            p = workspace
+    elif not p.is_absolute() and workspace:
         p = workspace / p
     resolved = p.resolve()
     if allowed_dir:

@@ -59,7 +59,8 @@ class ThinkingSpinner:
 class StreamRenderer:
     """Rich Live streaming with markdown. auto_refresh=False avoids render races.
 
-    Deltas arrive pre-filtered (no <think> tags) from the agent loop.
+    Deltas arrive live from the agent loop; think tags are stripped at
+    render time so partial think blocks are never shown to the user.
 
     Flow per round:
       spinner -> first visible delta -> header + Live renders ->
@@ -84,7 +85,9 @@ class StreamRenderer:
         self._start_spinner()
 
     def _render(self):
-        return Markdown(self._buf) if self._md and self._buf else Text(self._buf or "")
+        from nanobot.utils.helpers import strip_think
+        buf = strip_think(self._buf) if self._buf else ""
+        return Markdown(buf) if self._md and buf else Text(buf or "")
 
     def _start_spinner(self) -> None:
         if self._show_spinner:
@@ -118,15 +121,19 @@ class StreamRenderer:
 
         if self._live is None:
             c = _make_console()
-            # Clear the temporary live region on stop so we can print the full
-            # buffered response without duplicating a height-clipped preview.
+            # transient=False: keep the rendered content on screen when Live
+            # stops, avoiding the clear-then-reprint cycle that causes
+            # duplicated output when the terminal doesn't perfectly process
+            # the transient clearing escape sequences.
             self._live = Live(
                 self._render(),
                 console=c,
                 auto_refresh=False,
-                transient=True,
+                transient=False,
             )
             self._live.start()
+            self._t = time.monotonic()
+            return
         now = time.monotonic()
         if "\n" in delta or (now - self._t) > 0.05:
             self._live.update(self._render())
@@ -135,12 +142,10 @@ class StreamRenderer:
 
     async def on_end(self, *, resuming: bool = False) -> None:
         if self._live:
-            self._live.update(self._render())
-            self._live.refresh()
+            # With transient=False, stop() leaves the last rendered frame
+            # on screen — no reprint needed, avoiding duplicated output.
             self._live.stop()
             self._live = None
-            if self._header_printed and self._buf:
-                _make_console().print(self._render())
         self._stop_spinner()
         printed_newline = False
         if self.streamed and (not self._use_live or self._header_printed):

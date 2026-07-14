@@ -7,6 +7,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import secrets
 import string
 import time
@@ -149,6 +150,7 @@ class OpenAICompatProvider(LLMProvider):
         timeout: float = 60.0,
         spec: ProviderSpec | None = None,
         token_provider: Callable[[], str] | None = None,
+        keep_alive_interval: float = 0.0,
     ):
         key_pool = [k for k in (api_keys or []) if k]
         if not key_pool and api_key:
@@ -183,6 +185,8 @@ class OpenAICompatProvider(LLMProvider):
             default_headers.update(extra_headers)
         self._effective_base = effective_base
         self._default_headers = default_headers
+        self._keep_alive_interval = max(0.0, float(keep_alive_interval))
+        self._keep_alive_task: asyncio.Task | None = None
 
         if self.api_key and self._spec and self._spec.env_key:
             self._setup_env(self.api_key, self.api_base)
@@ -194,6 +198,56 @@ class OpenAICompatProvider(LLMProvider):
         idx = 0 if index is None else (index % len(self._api_keys))
         digest = hashlib.sha1(self._api_keys[idx].encode()).hexdigest()[:8]
         return f"key#{idx + 1}/{len(self._api_keys)}[{digest}]"
+
+    def start_keep_alive(self) -> None:
+        """Start a background keep-alive ping to prevent cold starts.
+        
+        Only effective if keep_alive_interval > 0 was set in constructor.
+        Sends minimal 'ping' requests to keep the LLM warm.
+        """
+        if self._keep_alive_interval <= 0:
+            return
+        if self._keep_alive_task is not None and not self._keep_alive_task.done():
+            return
+        self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
+        logger.info("Keep-alive ping started (every {:.0f}s)", self._keep_alive_interval)
+
+    def stop_keep_alive(self) -> None:
+        """Stop the keep-alive ping."""
+        if self._keep_alive_task is not None:
+            self._keep_alive_task.cancel()
+            self._keep_alive_task = None
+
+    async def _keep_alive_loop(self) -> None:
+        """Background loop that sends minimal ping requests."""
+        while True:
+            try:
+                await asyncio.sleep(self._keep_alive_interval)
+                await self._send_ping()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Keep-alive ping failed: {}", e)
+
+    async def _send_ping(self) -> None:
+        """Send a minimal ping request to keep the LLM warm."""
+        client = self._build_client()
+        try:
+            await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.default_model,
+                    messages=[
+                        {"role": "system", "content": "Reply with exactly: pong"},
+                        {"role": "user", "content": "ping"},
+                    ],
+                    max_tokens=4,
+                    temperature=0.0,
+                ),
+                timeout=30.0,  # Short timeout for ping
+            )
+            logger.debug("Keep-alive ping: pong received")
+        except Exception as e:
+            logger.debug("Keep-alive ping timeout/error: {}", e)
 
     def _next_request_start(self) -> int:
         """Round-robin the starting key so concurrent requests do not share mutable state."""
@@ -357,7 +411,11 @@ class OpenAICompatProvider(LLMProvider):
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
-        """Return True when exception indicates quota/rate limiting or temporary overload."""
+        """Return True when exception indicates quota/rate limiting or temporary overload.
+        
+        Note: Timeouts are NOT considered rate-limit errors - they indicate
+        connectivity issues, not quota exhaustion.
+        """
         status = getattr(exc, "status_code", None)
         if status is None:
             resp = getattr(exc, "response", None)
@@ -365,14 +423,15 @@ class OpenAICompatProvider(LLMProvider):
         if status in (429, 503):
             return True
         msg = str(exc).lower()
+        # Explicitly exclude timeout-related errors
+        if "timeout" in msg or "timed out" in msg:
+            return False
         return any(m in msg for m in (
             "rate limit",
             "rate_limit",
             "quota",
             "resource_exhausted",
             "429",
-            "timeout",
-            "timed out",
             "unavailable",
             "service unavailable",
             "high demand",
@@ -668,6 +727,123 @@ class OpenAICompatProvider(LLMProvider):
             for url in image_urls:
                 user_parts.append({"type": "image_url", "image_url": {"url": url}})
             result.append({"role": "user", "content": user_parts})
+        return result
+
+    # ------------------------------------------------------------------
+    # Vision fallback: describe images via a vision-capable model when
+    # the primary model rejects image content.
+    # ------------------------------------------------------------------
+
+    async def _describe_images_via_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        reason: str = "vision",
+    ) -> list[dict[str, Any]] | None:
+        """Describe images via the configured vision fallback model.
+
+        Collects all ``image_url`` blocks from *messages*, sends them to the
+        vision fallback model (e.g. ``mimo-v2.5``) with a "describe this
+        image" prompt, and replaces each ``image_url`` block with a ``text``
+        block containing the description.
+
+        Returns the modified messages, or ``None`` if no fallback model is
+        configured or the fallback call failed (caller falls back to
+        :meth:`_strip_image_content`).
+        """
+        spec = self._spec
+        if not spec or not getattr(spec, "vision_fallback_model", None):
+            return None
+
+        # Collect image_url blocks and their (msg_idx, blk_idx) locations.
+        image_blocks: list[dict[str, Any]] = []
+        image_locations: set[tuple[int, int]] = set()
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for blk_idx, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    image_blocks.append(block)
+                    image_locations.add((msg_idx, blk_idx))
+
+        if not image_blocks:
+            return None
+
+        vision_model = spec.vision_fallback_model
+        # Build a single user message asking the vision model to describe
+        # every image, preserving order so we can map descriptions back.
+        desc_parts: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                "Describe each image below. For each image, provide a concise "
+                "but complete description including: UI elements, visible text, "
+                "layout, colors, and current state. Number your descriptions "
+                "Image 1, Image 2, etc. in the order they appear."
+            ),
+        }]
+        desc_parts.extend(image_blocks)
+        vision_messages: list[dict[str, Any]] = [
+            {"role": "user", "content": desc_parts},
+        ]
+
+        try:
+            response = await self._safe_chat(
+                messages=vision_messages,
+                tools=None,
+                model=vision_model,
+                max_tokens=2048,
+                temperature=0.3,
+                reasoning_effort=None,
+                tool_choice=None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Vision fallback (model={}) call failed: {}. "
+                "Falling back to image stripping.",
+                vision_model, exc,
+            )
+            return None
+
+        if response.finish_reason == "error" or not response.content:
+            logger.warning(
+                "Vision fallback (model={}) returned an error: {}. "
+                "Falling back to image stripping.",
+                vision_model, (response.content or "")[:200],
+            )
+            return None
+
+        description = response.content.strip()
+        # Split by "Image N" markers if the model followed instructions.
+        segments = re.split(r"\n(?=Image \d+)", description)
+        if len(segments) >= len(image_blocks):
+            descriptions = [s.strip() for s in segments[:len(image_blocks)]]
+        else:
+            # Model didn't number them; use the whole description for each image.
+            descriptions = [description] * len(image_blocks)
+
+        # Replace image_url blocks with text descriptions.
+        result: list[dict[str, Any]] = []
+        img_counter = 0
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+            new_content: list[Any] = []
+            for blk_idx, block in enumerate(content):
+                if (msg_idx, blk_idx) in image_locations:
+                    path = (block.get("_meta") or {}).get("path", "")
+                    desc = descriptions[img_counter] if img_counter < len(descriptions) else description
+                    note = f"[Image described by {vision_model}"
+                    if path:
+                        note += f" (path={path})"
+                    note += f"]:\n{desc}"
+                    new_content.append({"type": "text", "text": note})
+                    img_counter += 1
+                else:
+                    new_content.append(block)
+            result.append({**msg, "content": new_content})
         return result
 
     @classmethod
@@ -1185,12 +1361,17 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=(
+                getattr(msg, "reasoning_content", None)
+                or (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+                or None
+            ),
         )
 
     @classmethod
     def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
@@ -1244,6 +1425,9 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
+                rc = delta.get("reasoning_content")
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
                     _accum_tc(tc, idx)
                 usage = cls._extract_usage(chunk_map) or usage
@@ -1258,6 +1442,10 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
+            if delta:
+                rc = getattr(delta, "reasoning_content", None)
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
 
@@ -1276,6 +1464,7 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
         )
 
     @staticmethod
@@ -1318,6 +1507,18 @@ class OpenAICompatProvider(LLMProvider):
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
                     )
+                
+                # Debug: log request size before sending
+                try:
+                    msg_count = len(messages)
+                    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+                    logger.debug(
+                        "LLM request: model={}, messages={}, ~{} chars, api_base={}",
+                        resolved_model, msg_count, total_chars, self._api_base,
+                    )
+                except Exception:
+                    pass  # Debug logging should never break the request flow
+                
                 await self._wait_for_rate_limit()
                 if len(self._api_keys) > 1:
                     logger.info(
