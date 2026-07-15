@@ -25,6 +25,8 @@ def test_nanobot_config_example_attaches_marketing_context_repo() -> None:
     assert '"contextRepos"' in config
     assert '"telegram"' in config
     assert '"enabled": true' in config
+    assert '"agentBrowser"' in config
+    assert '"enabled": false' in config
     assert '"fastCommands"' in config
     assert '"/connection_status"' in config
 
