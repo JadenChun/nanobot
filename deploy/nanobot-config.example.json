@@ -55,6 +55,12 @@
   },
   "tools": {
     "restrictToWorkspace": false,
+    "agentBrowser": {
+      "enabled": false,
+      "package": "agent-browser",
+      "timeout": 180,
+      "maxOutputChars": 12000
+    },
     "exec": {
       "enable": true,
       "timeout": 120,
