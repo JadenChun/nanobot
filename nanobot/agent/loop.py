@@ -38,6 +38,12 @@ from nanobot.agent.tools.pipeline import SpawnPipelineTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.trend_vpn import (
+    TrendVpnFetchTool,
+    TrendVpnSessionCloseTool,
+    TrendVpnSessionStartTool,
+    vpn_tools_enabled,
+)
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.write_guard import FileLockRegistry
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -446,6 +452,10 @@ class AgentLoop:
             ))
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        if vpn_tools_enabled():
+            self.tools.register(TrendVpnSessionStartTool())
+            self.tools.register(TrendVpnFetchTool())
+            self.tools.register(TrendVpnSessionCloseTool())
         if image_generation_available(self.image_config):
             self.tools.register(ImageGenerationTool(config=self.image_config, workspace=self.workspace))
         if self.agent_browser_config.enabled:
