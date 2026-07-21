@@ -39,6 +39,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.trend_vpn import (
+    TrendVpnBrowserFetchTool,
     TrendVpnFetchTool,
     TrendVpnSessionCloseTool,
     TrendVpnSessionStartTool,
@@ -455,6 +456,7 @@ class AgentLoop:
         if vpn_tools_enabled():
             self.tools.register(TrendVpnSessionStartTool())
             self.tools.register(TrendVpnFetchTool())
+            self.tools.register(TrendVpnBrowserFetchTool())
             self.tools.register(TrendVpnSessionCloseTool())
         if image_generation_available(self.image_config):
             self.tools.register(ImageGenerationTool(config=self.image_config, workspace=self.workspace))
