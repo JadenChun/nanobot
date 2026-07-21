@@ -200,7 +200,7 @@ class TestDispatch:
             await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)
 
     @pytest.mark.asyncio
-    async def test_dispatch_streams_only_final_segment_when_result_mode(self):
+    async def test_dispatch_defers_terminal_stream_until_completion_in_result_mode(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
         from nanobot.config.schema import ChannelsConfig
 
@@ -220,7 +220,13 @@ class TestDispatch:
         async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
             assert on_stream is not None
             assert on_stream_end is not None
-            await on_stream("checking first")
+            # This is the initial action response. The real loop runs internal
+            # verification after this callback and may then start a revision.
+            await on_stream("failed response")
+            await on_stream_end(resuming=False)
+            assert bus.outbound_size == 0
+
+            # A revision starts a fresh stream segment after verification.
             await on_stream_end(resuming=True)
             await on_stream("final answer")
             await on_stream_end(resuming=False)
@@ -228,24 +234,16 @@ class TestDispatch:
                 channel="matrix",
                 chat_id="!room:matrix.org",
                 content="final answer",
-                metadata={"_streamed": True},
+                metadata={"_streamed": True, "message_id": 10},
             )
 
         loop._process_message = fake_process
 
         await loop._dispatch(msg)
-        first = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-        second = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-        third = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
 
-        assert first.content == "final answer"
-        assert first.metadata["thread_root_event_id"] == "$root1"
-        assert first.metadata["thread_reply_to_event_id"] == "$reply1"
-        assert first.metadata["_stream_delta"] is True
-        assert first.metadata["_stream_id"].endswith(":1")
-        assert second.metadata["_stream_end"] is True
-        assert second.metadata["_stream_id"] == first.metadata["_stream_id"]
-        assert third.metadata["_streamed"] is True
+        assert out.content == "final answer"
+        assert out.metadata == {"message_id": 10}
 
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)

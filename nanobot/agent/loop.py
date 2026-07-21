@@ -1744,7 +1744,12 @@ End your response with exactly:
                     if msg.channel != "cli":
                         task_update_mode = self._channel_task_update_mode(msg.channel)
                         stream_progress_enabled = (task_update_mode == "verbose")
-                        defer_terminal_stream_until_completion = (task_update_mode == "plan_result")
+                        # Result mode must wait for the complete action/verification/
+                        # revision cycle before exposing terminal streamed content.
+                        defer_terminal_stream_until_completion = task_update_mode in {
+                            "result",
+                            "plan_result",
+                        }
 
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
