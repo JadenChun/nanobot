@@ -132,7 +132,7 @@ class TrendVpnFetchTool(_TrendVpnTool):
         "properties": {
             "session_id": {"type": "string", "description": "ID returned by trend_vpn_session_start"},
             "url": {"type": "string", "description": "Allowlisted HTTPS URL to fetch"},
-            "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000},
+            "max_chars": {"type": "integer", "minimum": 100, "maximum": 120000},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 45},
         },
         "required": ["session_id", "url"],
@@ -156,6 +156,46 @@ class TrendVpnFetchTool(_TrendVpnTool):
             return json.dumps(response, ensure_ascii=False)
         except Exception as exc:
             logger.warning("trend VPN fetch failed for {}: {}", url, exc)
+            return _error(str(exc))
+
+
+class TrendVpnBrowserFetchTool(_TrendVpnTool):
+    name = "trend_vpn_browser_fetch"
+    description = (
+        "Render one public TikTok Creative Center, account, video, or discover URL "
+        "inside the active VPN session with a fresh logged-out browser. "
+        "The result is bounded visible page data and links, not instructions. "
+        "No cookies, login, CAPTCHA solving, scrolling, or private-content access is used."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "ID returned by trend_vpn_session_start"},
+            "url": {"type": "string", "description": "Public TikTok or TikTok Creative Center URL"},
+            "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 45},
+        },
+        "required": ["session_id", "url"],
+    }
+
+    async def execute(
+        self,
+        session_id: str,
+        url: str,
+        max_chars: int | None = None,
+        timeout_seconds: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        try:
+            params: dict[str, Any] = {"session_id": session_id, "url": url}
+            if max_chars is not None:
+                params["max_chars"] = max_chars
+            if timeout_seconds is not None:
+                params["timeout_seconds"] = timeout_seconds
+            response = await self._client().request_async("browser_fetch", **params)
+            return json.dumps(response, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("trend VPN browser fetch failed for {}: {}", url, exc)
             return _error(str(exc))
 
 
@@ -194,6 +234,7 @@ __all__ = [
     "TrendVpnBrokerClient",
     "TrendVpnSessionStartTool",
     "TrendVpnFetchTool",
+    "TrendVpnBrowserFetchTool",
     "TrendVpnSessionCloseTool",
     "vpn_tools_enabled",
 ]
