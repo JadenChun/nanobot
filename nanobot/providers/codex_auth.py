@@ -121,11 +121,10 @@ def format_codex_usage(payload: dict[str, Any]) -> str:
 
         reset_at = _as_timestamp(_first_value(window, "reset_at", "resetsAt"))
         if reset_at is not None:
-            seconds_left = max(0, int(reset_at - time.time()))
             reset_time = datetime.fromtimestamp(reset_at, tz=MALAYSIA_TIMEZONE).strftime(
                 "%Y-%m-%d %H:%M MYT"
             )
-            reset_detail = f"Resets in {_format_duration(seconds_left)} ({reset_time})"
+            reset_detail = f"Reset at {reset_time}"
 
         if details:
             lines.append(f"{label}: " + "; ".join(details))
@@ -164,17 +163,6 @@ def _as_timestamp(value: Any) -> float | None:
     if timestamp is None:
         return None
     return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
-
-
-def _format_duration(seconds: int) -> str:
-    if seconds >= 3600:
-        hours, remainder = divmod(seconds, 3600)
-        minutes = remainder // 60
-        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
-    minutes, remainder = divmod(seconds, 60)
-    if minutes and remainder:
-        return f"{minutes}m {remainder}s"
-    return f"{minutes}m" if minutes else f"{remainder}s"
 
 
 def _nanobot_token_path() -> Path:
