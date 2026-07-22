@@ -6,9 +6,10 @@ import base64
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from oauth_cli_kit.models import OAuthToken
@@ -16,6 +17,7 @@ from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
 
 _REFRESH_EARLY_SECONDS = 300
 DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+MALAYSIA_TIMEZONE = ZoneInfo("Asia/Kuala_Lumpur")
 
 
 class CodexUsageError(RuntimeError):
@@ -114,17 +116,13 @@ def format_codex_usage(payload: dict[str, Any]) -> str:
         used_number = _as_number(used)
         if used_number is not None:
             remaining = max(0.0, 100.0 - used_number)
-            details.append(f"{used_number:g}% used ({remaining:g}% remaining)")
-
-        duration = _window_duration_seconds(window)
-        if duration is not None:
-            details.append(f"window {_format_duration(duration)}")
+            details.append(f"{remaining:g}% remaining")
 
         reset_at = _as_timestamp(_first_value(window, "reset_at", "resetsAt"))
         if reset_at is not None:
             seconds_left = max(0, int(reset_at - time.time()))
-            reset_time = datetime.fromtimestamp(reset_at, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M UTC"
+            reset_time = datetime.fromtimestamp(reset_at, tz=MALAYSIA_TIMEZONE).strftime(
+                "%Y-%m-%d %H:%M MYT"
             )
             details.append(f"resets in {_format_duration(seconds_left)} ({reset_time})")
 
@@ -163,17 +161,6 @@ def _as_timestamp(value: Any) -> float | None:
     if timestamp is None:
         return None
     return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
-
-
-def _window_duration_seconds(window: dict[str, Any]) -> int | None:
-    seconds = _first_value(window, "limit_window_seconds", "window_duration_seconds")
-    number = _as_number(seconds)
-    if number is not None:
-        return max(0, int(number))
-    minutes = _as_number(_first_value(window, "window_duration_mins", "windowDurationMins"))
-    if minutes is not None:
-        return max(0, int(minutes * 60))
-    return None
 
 
 def _format_duration(seconds: int) -> str:

@@ -192,6 +192,6 @@ def test_format_codex_usage_renders_windows_and_reset_time(monkeypatch: pytest.M
     )
 
     assert "Codex quota (plus):" in content
-    assert "Primary: 25% used (75% remaining)" in content
-    assert "window 15m" in content
-    assert "resets in 1h (2023-11-14 23:13 UTC)" in content
+    assert "Primary: 75% remaining" in content
+    assert "window 15m" not in content
+    assert "resets in 1h (2023-11-15 07:13 MYT)" in content
