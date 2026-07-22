@@ -206,6 +206,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("quota", "Show Codex OAuth quota"),
     ]
 
     @classmethod
@@ -309,6 +310,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("quota", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
         self._app.add_handler(MessageHandler(filters.COMMAND, self._forward_command))
 
@@ -749,6 +751,7 @@ class TelegramChannel(BaseChannel):
             "/stop — Stop the current task\n"
             "/restart — Restart the bot\n"
             "/status — Show bot status\n"
+            "/quota — Show Codex OAuth quota\n"
             "/help — Show available commands"
         )
 

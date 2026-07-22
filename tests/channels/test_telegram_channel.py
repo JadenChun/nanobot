@@ -196,6 +196,7 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert builder.get_updates_request_value is poll_req
     assert app.updater.start_polling_kwargs["error_callback"] == channel._on_polling_error
     assert any(cmd.command == "status" for cmd in app.bot.commands)
+    assert any(cmd.command == "quota" for cmd in app.bot.commands)
     assert any(
         getattr(handler, "callback", None) == channel._forward_command
         and handler.__class__.__name__ == "MessageHandler"
@@ -1239,6 +1240,26 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quota_command_is_forwarded_in_group() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    await channel._forward_command(_make_telegram_update(text="/quota"), None)
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "/quota"
+
+
+@pytest.mark.asyncio
 async def test_forward_command_rejects_unapproved_group_chat() -> None:
     channel = TelegramChannel(
         TelegramConfig(
@@ -1316,3 +1337,4 @@ async def test_on_help_includes_restart_command() -> None:
     help_text = update.message.reply_text.await_args.args[0]
     assert "/restart" in help_text
     assert "/status" in help_text
+    assert "/quota" in help_text
