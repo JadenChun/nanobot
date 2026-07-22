@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.trend_vpngate import VpnGateDiscoveryError, fetch_candidates
 
 
 DEFAULT_SOCKET_PATH = "/run/agent-vpn-broker/broker.sock"
@@ -24,7 +25,7 @@ class TrendVpnBrokerError(RuntimeError):
 class TrendVpnBrokerClient:
     """One-request JSON-lines client for the local Unix socket."""
 
-    def __init__(self, socket_path: str | None = None, timeout_seconds: float = 120.0):
+    def __init__(self, socket_path: str | None = None, timeout_seconds: float = 240.0):
         self.socket_path = socket_path or os.environ.get(
             "AGENT_VPN_BROKER_SOCKET", DEFAULT_SOCKET_PATH
         )
@@ -95,8 +96,10 @@ class TrendVpnSessionStartTool(_TrendVpnTool):
     name = "trend_vpn_session_start"
     description = (
         "Start a short-lived, isolated VPN session for trend research. "
-        "Use this before trend_vpn_fetch and always close it afterward. "
-        "Only the broker's fixed VPN profile is used; this tool cannot run shell commands."
+        "The agent first checks the official VPN Gate relay list, ranks a small "
+        "candidate set, and asks the privileged broker to verify candidates one "
+        "at a time until a tunnel works. Use this before trend_vpn_fetch and "
+        "always close it afterward. This tool cannot run shell commands."
     )
     parameters = {
         "type": "object",
@@ -113,8 +116,30 @@ class TrendVpnSessionStartTool(_TrendVpnTool):
     async def execute(self, ttl_seconds: int | None = None, **kwargs: Any) -> str:
         try:
             params = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
-            response = await self._client().request_async("start_session", **params)
-            return json.dumps(response, ensure_ascii=False)
+            candidates = await asyncio.to_thread(fetch_candidates, max_candidates=8)
+            failures: list[str] = []
+            for candidate in candidates:
+                try:
+                    response = await self._client().request_async(
+                        "start_session",
+                        **params,
+                        relay_profile=candidate.profile_text,
+                        relay_label=candidate.label,
+                        relay_timeout_seconds=20,
+                    )
+                    logger.info("trend VPN session started via {}", candidate.label)
+                    return json.dumps(response, ensure_ascii=False)
+                except TrendVpnBrokerError as exc:
+                    detail = str(exc)[:180]
+                    failures.append(f"{candidate.hostname}: {detail}")
+                    logger.warning("VPN Gate candidate {} failed: {}", candidate.label, detail)
+                    if "another VPN session is already active" in detail:
+                        break
+            summary = "; ".join(failures[-4:]) or "no candidate succeeded"
+            return _error(f"VPN Gate candidates did not produce a working tunnel: {summary}")
+        except VpnGateDiscoveryError as exc:
+            logger.warning("VPN Gate discovery failed: {}", exc)
+            return _error(str(exc))
         except Exception as exc:
             logger.warning("trend VPN session start failed: {}", exc)
             return _error(str(exc))
