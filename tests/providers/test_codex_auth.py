@@ -12,6 +12,8 @@ from nanobot.providers.codex_auth import (
     _official_codex_auth_path,
     _refresh_token,
     _write_official_codex_auth,
+    format_codex_usage,
+    get_codex_usage,
     get_token,
 )
 
@@ -137,3 +139,59 @@ def test_write_official_codex_auth_updates_tokens_block(tmp_path: Path) -> None:
     assert payload["tokens"]["refresh_token"] == "refresh_123"
     assert payload["tokens"]["account_id"] == "acct_write"
     assert "last_refresh" in payload
+
+
+def test_get_codex_usage_uses_oauth_account_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Token:
+        access = "access_123"
+        account_id = "acct_123"
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 25}}}
+
+    captured: dict[str, object] = {}
+
+    def _get(url: str, **kwargs: object) -> _Response:
+        captured["url"] = url
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("nanobot.providers.codex_auth.get_token", lambda: _Token())
+    monkeypatch.setattr("nanobot.providers.codex_auth.httpx.get", _get)
+
+    payload = get_codex_usage()
+
+    assert payload["plan_type"] == "plus"
+    assert captured["url"] == "https://chatgpt.com/backend-api/wham/usage"
+    assert captured["headers"] == {
+        "Authorization": "Bearer access_123",
+        "ChatGPT-Account-ID": "acct_123",
+        "originator": "codex_cli_rs",
+        "Accept": "application/json",
+    }
+
+
+def test_format_codex_usage_renders_windows_and_reset_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("nanobot.providers.codex_auth.time.time", lambda: 1_700_000_000)
+
+    content = format_codex_usage(
+        {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": 900,
+                    "reset_at": 1_700_003_600,
+                }
+            },
+        }
+    )
+
+    assert "Codex quota (plus):" in content
+    assert "Primary: 25% used (75% remaining)" in content
+    assert "window 15m" in content
+    assert "resets in 1h (2023-11-14 23:13 UTC)" in content

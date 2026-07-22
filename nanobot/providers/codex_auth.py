@@ -6,7 +6,7 @@ import base64
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,11 @@ from oauth_cli_kit.models import OAuthToken
 from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
 
 _REFRESH_EARLY_SECONDS = 300
+DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+class CodexUsageError(RuntimeError):
+    """Raised when the Codex OAuth usage endpoint cannot be read."""
 
 
 def get_token(min_ttl_seconds: int = 60) -> OAuthToken:
@@ -50,6 +55,136 @@ def get_token(min_ttl_seconds: int = 60) -> OAuthToken:
         "OAuth credentials not found. Run `codex login` locally and copy "
         "`~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) to this machine."
     )
+
+
+def get_codex_usage() -> dict[str, Any]:
+    """Fetch the current ChatGPT/Codex usage windows for the OAuth account."""
+    token = get_token()
+    usage_url = os.environ.get("NANOBOT_CODEX_USAGE_URL", DEFAULT_CODEX_USAGE_URL)
+    try:
+        response = httpx.get(
+            usage_url,
+            headers={
+                "Authorization": f"Bearer {token.access}",
+                "ChatGPT-Account-ID": token.account_id,
+                "originator": "codex_cli_rs",
+                "Accept": "application/json",
+            },
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        raise CodexUsageError("Codex quota request failed due to a network error.") from exc
+
+    if response.status_code == 401:
+        raise CodexUsageError("Codex OAuth credentials were rejected. Run the OpenAI login again.")
+    if response.status_code == 429:
+        raise CodexUsageError("Codex quota endpoint is rate-limited. Please try again shortly.")
+    if response.status_code != 200:
+        raise CodexUsageError(f"Codex quota request failed (HTTP {response.status_code}).")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise CodexUsageError("Codex returned an invalid quota response.") from exc
+    if not isinstance(payload, dict):
+        raise CodexUsageError("Codex returned an unexpected quota response.")
+    return payload
+
+
+def format_codex_usage(payload: dict[str, Any]) -> str:
+    """Render the Codex usage response without exposing token data."""
+    plan = _first_value(payload, "plan_type", "planType")
+    rate_limit = _first_value(payload, "rate_limit", "rateLimits")
+    lines = ["Codex quota" + (f" ({plan})" if plan else "") + ":"]
+
+    if not isinstance(rate_limit, dict):
+        lines.append("No rate-limit data was returned.")
+        return "\n".join(lines)
+
+    windows = (
+        ("Primary", _first_value(rate_limit, "primary_window", "primary")),
+        ("Secondary", _first_value(rate_limit, "secondary_window", "secondary")),
+    )
+    rendered = 0
+    for label, window in windows:
+        if not isinstance(window, dict):
+            continue
+        details: list[str] = []
+        used = _first_value(window, "used_percent", "usedPercent")
+        used_number = _as_number(used)
+        if used_number is not None:
+            remaining = max(0.0, 100.0 - used_number)
+            details.append(f"{used_number:g}% used ({remaining:g}% remaining)")
+
+        duration = _window_duration_seconds(window)
+        if duration is not None:
+            details.append(f"window {_format_duration(duration)}")
+
+        reset_at = _as_timestamp(_first_value(window, "reset_at", "resetsAt"))
+        if reset_at is not None:
+            seconds_left = max(0, int(reset_at - time.time()))
+            reset_time = datetime.fromtimestamp(reset_at, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            details.append(f"resets in {_format_duration(seconds_left)} ({reset_time})")
+
+        if details:
+            lines.append(f"{label}: " + "; ".join(details))
+            rendered += 1
+
+    if rendered == 0:
+        lines.append("No rate-limit windows were returned.")
+    return "\n".join(lines)
+
+
+def _first_value(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _as_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _as_timestamp(value: Any) -> float | None:
+    timestamp = _as_number(value)
+    if timestamp is None:
+        return None
+    return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+
+
+def _window_duration_seconds(window: dict[str, Any]) -> int | None:
+    seconds = _first_value(window, "limit_window_seconds", "window_duration_seconds")
+    number = _as_number(seconds)
+    if number is not None:
+        return max(0, int(number))
+    minutes = _as_number(_first_value(window, "window_duration_mins", "windowDurationMins"))
+    if minutes is not None:
+        return max(0, int(minutes * 60))
+    return None
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds >= 3600:
+        hours, remainder = divmod(seconds, 3600)
+        minutes = remainder // 60
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes and remainder:
+        return f"{minutes}m {remainder}s"
+    return f"{minutes}m" if minutes else f"{remainder}s"
 
 
 def _nanobot_token_path() -> Path:

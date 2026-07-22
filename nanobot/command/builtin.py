@@ -74,6 +74,25 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_quota(ctx: CommandContext) -> OutboundMessage:
+    """Show the current ChatGPT/Codex OAuth quota windows."""
+    from nanobot.providers.codex_auth import format_codex_usage, get_codex_usage
+
+    try:
+        payload = await asyncio.to_thread(get_codex_usage)
+        content = format_codex_usage(payload)
+    except RuntimeError as exc:
+        content = f"Unable to check Codex quota: {exc}"
+    except Exception:
+        content = "Unable to check Codex quota due to an unexpected error."
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
@@ -108,6 +127,7 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/quota — Show Codex OAuth quota",
         "/help — Show available commands",
     ]
     return "\n".join(lines)
@@ -118,6 +138,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
+    router.priority("/quota", cmd_quota)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/quota", cmd_quota)
     router.exact("/help", cmd_help)
