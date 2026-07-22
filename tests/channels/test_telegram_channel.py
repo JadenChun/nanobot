@@ -1253,7 +1253,7 @@ async def test_quota_command_is_forwarded_in_group() -> None:
 
     channel._handle_message = capture_handle
 
-    await channel._forward_command(_make_telegram_update(text="/quota"), None)
+    await channel._forward_command(_make_telegram_update(text="/quota@nanobot_test"), None)
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/quota"

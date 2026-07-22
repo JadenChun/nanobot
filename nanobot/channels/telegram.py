@@ -944,6 +944,17 @@ class TelegramChannel(BaseChannel):
             return ""
         return "/" + head[1:].split("@", 1)[0].lower()
 
+    @classmethod
+    def _normalize_command_text(cls, text: str | None) -> str:
+        """Normalize Telegram's optional @bot suffix before agent dispatch."""
+        if not text:
+            return ""
+        parts = text.strip().split(maxsplit=1)
+        command = cls._normalize_command(parts[0])
+        if not command:
+            return text
+        return command + (f" {parts[1]}" if len(parts) > 1 else "")
+
     async def _try_fast_command(self, message) -> bool:
         """Run configured exact slash-command shortcuts without invoking the agent."""
         command_name = self._normalize_command(getattr(message, "text", None))
@@ -1003,7 +1014,7 @@ class TelegramChannel(BaseChannel):
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
-            content=message.text or "",
+            content=self._normalize_command_text(message.text),
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )
