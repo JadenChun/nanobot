@@ -112,6 +112,7 @@ def format_codex_usage(payload: dict[str, Any]) -> str:
         if not isinstance(window, dict):
             continue
         details: list[str] = []
+        reset_detail: str | None = None
         used = _first_value(window, "used_percent", "usedPercent")
         used_number = _as_number(used)
         if used_number is not None:
@@ -124,11 +125,13 @@ def format_codex_usage(payload: dict[str, Any]) -> str:
             reset_time = datetime.fromtimestamp(reset_at, tz=MALAYSIA_TIMEZONE).strftime(
                 "%Y-%m-%d %H:%M MYT"
             )
-            details.append(f"resets in {_format_duration(seconds_left)} ({reset_time})")
+            reset_detail = f"Resets in {_format_duration(seconds_left)} ({reset_time})"
 
         if details:
             lines.append(f"{label}: " + "; ".join(details))
             rendered += 1
+        if reset_detail:
+            lines.append(reset_detail)
 
     if rendered == 0:
         lines.append("No rate-limit windows were returned.")
