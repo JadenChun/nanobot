@@ -37,9 +37,6 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     # Additional result destinations. channel/to remains the execution context.
     additional_destinations: list[CronDestination] = field(default_factory=list)
-    # Per-job overrides for the agent loop
-    planning_mode: Literal["on", "off", "agent"] | None = None  # None = use global default
-    skip_verification: bool = False
 
     def delivery_destinations(self) -> list[CronDestination]:
         """Return de-duplicated primary and additional result destinations."""

@@ -5,6 +5,7 @@ SOURCE_DIR="${1:-$(pwd)}"
 INSTALL_DIR="${MARKETING_AGENT_NANOBOT_DIR:-/opt/marketing-agent/nanobot-custom}"
 CONFIG_FILE="${MARKETING_AGENT_NANOBOT_CONFIG:-/opt/marketing-agent/.nanobot/config.json}"
 ENV_FILE="${MARKETING_AGENT_NANOBOT_ENV:-/opt/marketing-agent/secrets/nanobot.env}"
+CONTEXT_REPO="${MARKETING_AGENT_CONTEXT_REPO:-/opt/marketing-agent/client-marketing-assistance}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root or with sudo." >&2
@@ -70,6 +71,44 @@ if [[ ! -f "${ENV_FILE}" ]]; then
     "${INSTALL_DIR}/deploy/nanobot.env.example" "${ENV_FILE}"
   echo "Created ${ENV_FILE}. Fill OAUTH_BROKER_INTERNAL_API_KEY before starting Nanobot."
 fi
+
+# Existing installs keep their config across deploys. Migrate the marketing
+# context entry so generated Markdown memory is committed and pushed again.
+python3 - "${CONFIG_FILE}" "${CONTEXT_REPO}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+context_repo = str(Path(sys.argv[2]))
+payload = json.loads(config_path.read_text(encoding="utf-8"))
+entries = payload.get("agents", {}).get("defaults", {}).get("contextRepos", [])
+changed = False
+for entry in entries:
+    if not isinstance(entry, dict):
+        continue
+    if str(Path(str(entry.get("path", "")))) != context_repo:
+        continue
+    if entry.get("autoSync") is not True:
+        entry["autoSync"] = True
+        changed = True
+
+if changed:
+    fd, temporary = tempfile.mkstemp(prefix=".nanobot-config-", suffix=".json", dir=config_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, config_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f"Enabled context auto-sync in {config_path}")
+PY
 
 chown root:marketing-agent "${CONFIG_FILE}" "${ENV_FILE}"
 chmod 0640 "${CONFIG_FILE}" "${ENV_FILE}"

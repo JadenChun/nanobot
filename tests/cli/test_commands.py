@@ -555,6 +555,30 @@ def test_agent_logs_flag_prints_explicit_runtime_logs_banner(mock_agent_runtime)
     assert "Use --no-logs to hide internal logs." in stripped_output
 
 
+def test_agent_log_file_adds_rotating_file_sink(mock_agent_runtime, tmp_path: Path):
+    log_path = tmp_path / "agent.log"
+    with patch("loguru.logger.remove"), \
+         patch("loguru.logger.add") as add_log, \
+         patch("loguru.logger.enable"):
+        result = runner.invoke(
+            app,
+            ["agent", "-m", "hello", "--log-file", str(log_path)],
+        )
+
+    assert result.exit_code == 0
+    add_log.assert_called_once_with(
+        str(log_path),
+        rotation="20 MB",
+        retention="7 days",
+        compression="gz",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        enqueue=True,
+    )
+    output = _strip_ansi(result.stdout)
+    assert "Logging to" in output
+    assert "agent.log" in output
+
+
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
     config_path = tmp_path / "agent-config.json"
     config_path.write_text("{}")

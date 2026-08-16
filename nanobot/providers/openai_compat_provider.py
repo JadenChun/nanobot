@@ -60,6 +60,12 @@ def _is_reasoning_model(model_name: str) -> bool:
     return False
 
 
+def _requires_tool_reasoning_history(model_name: str) -> bool:
+    """DeepSeek thinking models require this field on every tool-call turn."""
+    bare = (model_name or "").split("/")[-1].lower()
+    return bare.startswith("deepseek")
+
+
 def _short_tool_id() -> str:
     """9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
@@ -573,9 +579,22 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         messages = self._split_tool_images_from_messages(messages)
+        sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
+        if _requires_tool_reasoning_history(model_name):
+            # DeepSeek returns HTTP 400 when any assistant tool-call turn in a
+            # thinking conversation omits reasoning_content. Some compatible
+            # gateways occasionally omit the empty field on one sub-turn, so
+            # preserve all returned values and add an explicit empty value only
+            # where the gateway failed to return one. DeepSeek also requires a
+            # non-null assistant content field for these messages.
+            for message in sanitized_messages:
+                if message.get("role") == "assistant" and message.get("tool_calls"):
+                    message.setdefault("reasoning_content", "")
+                    if message.get("content") is None:
+                        message["content"] = ""
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": sanitized_messages,
         }
         if temperature is not None:
             kwargs["temperature"] = temperature

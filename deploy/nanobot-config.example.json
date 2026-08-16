@@ -5,7 +5,6 @@
       "model": "anthropic/claude-opus-4-5",
       "provider": "auto",
       "timezone": "Asia/Kuala_Lumpur",
-      "planningMode": "agent",
       "maxTokens": {
         "input": 120000,
         "output": 4096
@@ -14,7 +13,7 @@
         {
           "path": "/opt/marketing-agent/client-marketing-assistance",
           "readOnly": false,
-          "autoSync": false
+          "autoSync": true
         }
       ]
     }

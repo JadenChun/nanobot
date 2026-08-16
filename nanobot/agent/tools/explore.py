@@ -1,4 +1,4 @@
-"""Planner-only explore tool backed by foreground read-only subagents."""
+"""Foreground read-only exploration tool for the main orchestrator."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ class ExploreTool(Tool):
 
     name = "explore"
     description = (
-        "Launch a foreground read-only explore subagent for broad or repeated investigation "
-        "without filling the planner context with raw search history. Use this only when "
+        "Launch a foreground read-only exploration role for broad or repeated investigation "
+        "without filling the main context with raw search history. Use this only when "
         "simple direct read/search tools are insufficient."
     )
     parameters = {
@@ -21,7 +21,7 @@ class ExploreTool(Tool):
         "properties": {
             "task": {
                 "type": "string",
-                "description": "Specific research task for the explore subagent.",
+                "description": "Specific research task for the exploration role.",
                 "minLength": 3,
             },
             "thoroughness": {

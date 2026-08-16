@@ -77,6 +77,33 @@ class TestMessageToolSuppressLogic:
         assert result.channel == "feishu"
 
     @pytest.mark.asyncio
+    async def test_cron_run_returns_final_result_after_explicit_message(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="message",
+            arguments={"content": "Attachment ready", "channel": "telegram", "chat_id": "123"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Final scheduled result", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda message: sent.append(message)))
+
+        msg = InboundMessage(channel="telegram", sender_id="cron", chat_id="123", content="Run")
+        result = await loop._process_message(msg, session_key="cron:daily-content")
+
+        assert len(sent) == 1
+        assert result is not None
+        assert result.content == "Final scheduled result"
+
+    @pytest.mark.asyncio
     async def test_not_suppress_when_no_message_tool_used(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Hello!", tool_calls=[]))

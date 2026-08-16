@@ -33,8 +33,7 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.ForegroundAgentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
@@ -581,31 +580,3 @@ async def test_loop_streaming_suppresses_intermediate_tool_preamble(tmp_path):
     # Deltas are now forwarded live for every iteration (not just the final one)
     assert deltas == ["Checking the repo now.", "All set."]
     assert endings == [True, False]
-
-
-@pytest.mark.asyncio
-async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, monkeypatch):
-    from nanobot.agent.subagent import SubagentManager
-    from nanobot.bus.queue import MessageBus
-
-    bus = MessageBus()
-    provider = MagicMock()
-    provider.get_default_model.return_value = "test-model"
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-        content="working",
-        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
-    ))
-    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-    mgr._announce_result = AsyncMock()
-
-    async def fake_execute(self, name, arguments):
-        return "tool result"
-
-    monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
-
-    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, notify=True)
-
-    mgr._announce_result.assert_awaited_once()
-    args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"

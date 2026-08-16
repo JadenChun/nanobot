@@ -11,6 +11,15 @@ import pytest
 from nanobot.agent.tools.web import WebFetchTool
 
 
+@pytest.mark.asyncio
+async def test_web_fetch_blocks_configured_login_gated_platform(monkeypatch):
+    monkeypatch.setenv("NANOBOT_WEB_FETCH_BLOCKED_HOSTS", "facebook.com,tiktok.com")
+
+    result = await WebFetchTool().execute("https://www.tiktok.com/tag/cats")
+
+    assert result.startswith("Error: direct web_fetch is disabled")
+
+
 def _fake_resolve_private(hostname, port, family=0, type_=0):
     return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
@@ -46,8 +55,6 @@ async def test_web_fetch_result_contains_untrusted_flag():
     tool = WebFetchTool()
 
     fake_html = "<html><head><title>Test</title></head><body><p>Hello world</p></body></html>"
-
-    import httpx
 
     class FakeResponse:
         status_code = 200

@@ -1,13 +1,12 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
-import shutil
 import select
+import shutil
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -511,6 +510,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -567,6 +567,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -593,9 +594,6 @@ def serve(
         model=runtime_config.agents.defaults.model,
         max_tokens=runtime_config.agents.defaults.max_tokens,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=runtime_config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=runtime_config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=runtime_config.agents.defaults.planner_max_parallel_explore_agents,
         web_search_config=runtime_config.tools.web.search,
         web_proxy=runtime_config.tools.web.proxy or None,
         exec_config=runtime_config.tools.exec,
@@ -724,9 +722,6 @@ def gateway(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=config.agents.defaults.planner_max_parallel_explore_agents,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
@@ -753,7 +748,6 @@ def gateway(
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.message import MessageTool
         from nanobot.cron.delivery import build_explicit_fanout_messages, build_result_messages
-        from nanobot.utils.evaluator import evaluate_response
 
         delivery_destinations = job.payload.delivery_destinations()
 
@@ -763,16 +757,14 @@ def gateway(
             f"Scheduled instruction: {job.payload.message}\n\n"
             "This is a fresh execution of this scheduled task. "
             "Execute it now — do not simply echo a status update or say 'in progress'. "
-            "Either complete the task directly and deliver the result, "
-            "or use the spawn tool to start background work and confirm to the user that work has begun. "
-            "If the background task needs to modify workspace files, include write_scope with the "
-            "workspace-relative files or directories it may change."
+            "Complete the task directly, wait for any foreground delegated work, and deliver "
+            "the finished result before this scheduled run ends. Return the concise, complete, "
+            "user-facing result directly in your final response. Keep reports and working files "
+            "internal unless the scheduled instruction explicitly asks for an attachment."
         )
 
         # Clear stale history so previous "in progress" messages don't mislead this run.
-        # Only wipes messages — metadata is preserved and any stale planner handoff in
-        # metadata is auto-cleared by the loop when the new message arrives.
-        # Background subagents are asyncio tasks and are unaffected by this clearing.
+        # Only messages are removed; scheduled-task metadata is preserved.
         cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
         cron_session.retain_recent_legal_suffix(0)
         agent.sessions.save(cron_session)
@@ -788,8 +780,6 @@ def gateway(
                     session_key=f"cron:{job.id}",
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to or "direct",
-                    planning_mode=job.payload.planning_mode,
-                    skip_verification=job.payload.skip_verification,
                     approval_granted=True,
                 )
             except Exception as exc:
@@ -807,33 +797,29 @@ def gateway(
                 cron_tool.reset_cron_context(cron_token)
 
         response = resp.content if resp else ""
-
         message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            for outbound in build_explicit_fanout_messages(
-                delivery_destinations,
-                message_tool.sent_messages_in_turn,
-            ):
-                await bus.publish_outbound(outbound)
-            return response
+        sent_messages = (
+            list(message_tool.sent_messages_in_turn)
+            if isinstance(message_tool, MessageTool)
+            else []
+        )
+        explicit_fanout = build_explicit_fanout_messages(
+            delivery_destinations,
+            sent_messages,
+        )
+        for outbound in explicit_fanout:
+            await bus.publish_outbound(outbound)
 
         if delivery_destinations and response:
             try:
-                should_notify = await evaluate_response(
-                    response, job.payload.message, provider, agent.model,
-                )
-                if should_notify:
-                    sent_messages = (
-                        message_tool.sent_messages_in_turn
-                        if isinstance(message_tool, MessageTool)
-                        else ()
-                    )
-                    for outbound in build_result_messages(
-                        response,
-                        delivery_destinations,
-                        sent_messages,
-                    ):
-                        await bus.publish_outbound(outbound)
+                # An explicit attachment or auxiliary message must never replace
+                # the completed text result of the scheduled task.
+                for outbound in build_result_messages(
+                    response,
+                    delivery_destinations,
+                    [*sent_messages, *explicit_fanout],
+                ):
+                    await bus.publish_outbound(outbound)
             except Exception as exc:
                 agent.record_task_failure(
                     session_key=f"cron:{job.id}",
@@ -1022,6 +1008,11 @@ def agent(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    log_file: str | None = typer.Option(
+        None,
+        "--log-file",
+        help="Write runtime logs to this file (rotated at 20 MB, 7 days kept)",
+    ),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -1044,17 +1035,29 @@ def agent(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
-    if logs:
-        # Remove default handler and add a dynamic stderr writer
-        # This allows prompt_toolkit.patch_stdout to intercept background logs
-        # so they don't overwrite the "You: " prompt.
+    if logs or log_file:
         logger.remove()
-        logger.add(
-            lambda msg: sys.stderr.write(msg),
-            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        )
+        if logs:
+            # Let prompt_toolkit intercept runtime logs so they do not overwrite
+            # the interactive input prompt.
+            logger.add(
+                lambda msg: sys.stderr.write(msg),
+                format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            )
+        if log_file:
+            logger.add(
+                log_file,
+                rotation="20 MB",
+                retention="7 days",
+                compression="gz",
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+                enqueue=True,
+            )
         logger.enable("nanobot")
-        console.print("[dim]Runtime logs enabled (--logs). Use --no-logs to hide internal logs.[/dim]")
+        if logs:
+            console.print("[dim]Runtime logs enabled (--logs). Use --no-logs to hide internal logs.[/dim]")
+        if log_file:
+            console.print(f"[dim]Logging to {log_file}[/dim]")
     else:
         logger.disable("nanobot")
 
@@ -1065,9 +1068,6 @@ def agent(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=config.agents.defaults.planner_max_parallel_explore_agents,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
@@ -1175,7 +1175,8 @@ def agent(
                                     pass
                             continue
                         if msg.metadata.get("_streamed"):
-                            turn_done.set()
+                            if msg.metadata.get("_cli_turn_complete"):
+                                turn_done.set()
                             continue
 
                         if msg.metadata.get("_progress"):
@@ -1187,7 +1188,7 @@ def agent(
                                 await _print_interactive_progress_line(msg.content, _thinking)
                             continue
 
-                        if not turn_done.is_set():
+                        if msg.metadata.get("_cli_turn_complete"):
                             if msg.content:
                                 turn_response.append((msg.content, dict(msg.metadata or {})))
                             turn_done.set()
@@ -1228,7 +1229,11 @@ def agent(
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
-                            metadata={"_wants_stream": True},
+                            # Interactive PowerShell output is rendered once at turn
+                            # completion. Rich Live cursor redraws are not reliable in
+                            # the legacy Windows console host, and a MessageTool send
+                            # may occur before the agent turn has actually completed.
+                            metadata={"_wants_stream": False},
                         ))
 
                         await turn_done.wait()

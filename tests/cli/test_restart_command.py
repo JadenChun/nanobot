@@ -25,7 +25,7 @@ def _make_loop():
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager"):
+         patch("nanobot.agent.loop.ForegroundAgentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 
@@ -182,8 +182,6 @@ class TestRestartCommand:
         session = MagicMock()
         session.get_history.return_value = []
         loop.sessions.get_or_create.return_value = session
-        loop.subagents.get_running_count.return_value = 0
-
         response = await loop.process_direct("/status", session_key="cli:test")
 
         assert response is not None

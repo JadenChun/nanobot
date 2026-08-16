@@ -233,9 +233,8 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
         content = msg.get("content")
 
         if role == "system":
-            # Collect all system messages and merge them; do not overwrite so
-            # that a planner handoff injected after the main system prompt is
-            # preserved rather than replacing the agent's identity and tools.
+            # Collect and merge every system message so later scoped guidance
+            # does not replace the agent's identity and tool instructions.
             part = content if isinstance(content, str) else ""
             if part:
                 system_parts.append(part)

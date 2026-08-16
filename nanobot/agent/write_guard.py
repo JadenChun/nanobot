@@ -29,7 +29,10 @@ class WriteScope:
         if not normalized:
             raise ValueError("write_scope directory prefixes must include a path before the trailing slash")
 
-        resolved = (workspace / normalized).resolve()
+        workspace_root = workspace.resolve()
+        resolved = (workspace_root / normalized).resolve()
+        if not _is_under(resolved, workspace_root):
+            raise ValueError("write_scope entries must stay inside the workspace")
         return cls(path=resolved, recursive=recursive)
 
     def allows(self, target: Path) -> bool:
@@ -82,34 +85,3 @@ class FileLockRegistry:
             current = self._owners.get(resolved)
             if current == owner:
                 self._owners.pop(resolved, None)
-
-
-class ScopeReservationRegistry:
-    """Session-local write-scope reservations for background subagents."""
-
-    def __init__(self) -> None:
-        self._guard = asyncio.Lock()
-        self._reservations: dict[str, dict[str, tuple[WriteScope, ...]]] = {}
-
-    async def reserve(
-        self,
-        session_key: str,
-        task_id: str,
-        scopes: tuple[WriteScope, ...],
-    ) -> tuple[bool, str | None]:
-        async with self._guard:
-            existing = self._reservations.setdefault(session_key, {})
-            for other_task_id, other_scopes in existing.items():
-                if any(scope.overlaps(other) for scope in scopes for other in other_scopes):
-                    return False, other_task_id
-            existing[task_id] = scopes
-            return True, None
-
-    async def release(self, session_key: str, task_id: str) -> None:
-        async with self._guard:
-            session_reservations = self._reservations.get(session_key)
-            if not session_reservations:
-                return
-            session_reservations.pop(task_id, None)
-            if not session_reservations:
-                self._reservations.pop(session_key, None)

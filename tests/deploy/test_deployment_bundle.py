@@ -15,7 +15,10 @@ def test_nanobot_systemd_service_uses_context_repo_and_secrets() -> None:
     assert "EnvironmentFile=/opt/marketing-agent/secrets/nanobot.env" in service
     assert "--config /opt/marketing-agent/.nanobot/config.json" in service
     assert "--log-file /opt/marketing-agent/logs/nanobot-gateway.log" in service
-    assert "ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs /opt/marketing-agent/.cache /opt/marketing-agent/.codex /opt/marketing-agent/.local" in service
+    assert (
+        "ReadWritePaths=/opt/marketing-agent/.nanobot /opt/marketing-agent/client-marketing-assistance /opt/marketing-agent/logs /opt/marketing-agent/.cache /opt/marketing-agent/.codex /opt/marketing-agent/.local"
+        in service
+    )
 
 
 def test_nanobot_config_example_attaches_marketing_context_repo() -> None:
@@ -23,6 +26,7 @@ def test_nanobot_config_example_attaches_marketing_context_repo() -> None:
 
     assert '"/opt/marketing-agent/client-marketing-assistance"' in config
     assert '"contextRepos"' in config
+    assert '"autoSync": true' in config
     assert '"telegram"' in config
     assert '"enabled": true' in config
     assert '"agentBrowser"' in config
@@ -38,6 +42,8 @@ def test_nanobot_deploy_script_supports_checkout_as_install_directory() -> None:
     assert 'INSTALL_REALPATH="$(realpath -m "${INSTALL_DIR}")"' in script
     assert 'if [[ "${SOURCE_REALPATH}" == "${INSTALL_REALPATH}" ]]; then' in script
     assert "skipping file copy" in script
+    assert 'entry["autoSync"] = True' in script
+    assert "Enabled context auto-sync" in script
     assert 'chmod 0640 "${CONFIG_FILE}" "${ENV_FILE}"' in script
 
 

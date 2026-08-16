@@ -97,15 +97,6 @@ class CronTool(Tool):
                         f"(e.g. '2026-02-12T10:30:00'). Naive values default to {self._default_timezone}."
                     ),
                 },
-                "planning_mode": {
-                    "type": "string",
-                    "enum": ["on", "off", "agent"],
-                    "description": "Override planning mode for this job: 'on' (always plan), 'off' (skip planner), 'agent' (agent decides). Default: use global setting.",
-                },
-                "skip_verification": {
-                    "type": "boolean",
-                    "description": "Skip the verification phase after action execution. Default: false.",
-                },
                 "additional_destinations": {
                     "type": "array",
                     "items": {
@@ -135,8 +126,6 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         additional_destinations: list[dict[str, str]] | None = None,
         **kwargs: Any,
     ) -> str:
@@ -149,8 +138,6 @@ class CronTool(Tool):
                 cron_expr,
                 tz,
                 at,
-                planning_mode,
-                skip_verification,
                 additional_destinations,
             )
         elif action == "list":
@@ -166,8 +153,6 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         additional_destinations: list[dict[str, str]] | None = None,
     ) -> str:
         if not message:
@@ -225,8 +210,6 @@ class CronTool(Tool):
             to=self._chat_id,
             additional_destinations=destinations,
             delete_after_run=delete_after,
-            planning_mode=planning_mode,
-            skip_verification=skip_verification,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
