@@ -63,6 +63,7 @@ class Nanobot:
             )
 
         provider = _make_provider(config)
+        crawler_provider = _make_crawler_provider(config)
         bus = MessageBus()
         defaults = config.agents.defaults
 
@@ -73,6 +74,8 @@ class Nanobot:
             model=defaults.model,
             max_tokens=defaults.max_tokens,
             max_iterations=defaults.max_tool_iterations,
+            crawler_agent_config=config.agents.crawler,
+            crawler_provider=crawler_provider,
             web_search_config=config.tools.web.search,
             web_proxy=config.tools.web.proxy or None,
             exec_config=config.tools.exec,
@@ -236,3 +239,26 @@ def _make_provider(config: Any) -> Any:
     fallback = FallbackProvider(providers)
     fallback.generation = gen
     return fallback
+
+
+def _make_crawler_provider(config: Any) -> Any | None:
+    """Create the optional crawler provider independently from the main agent."""
+    crawler = config.agents.crawler
+    from nanobot.agent.tools.social_crawl import crawl_tools_enabled
+
+    if not crawler.enabled or not crawl_tools_enabled():
+        return None
+    model = crawler.model or config.agents.defaults.model
+    provider_name = crawler.provider or config.get_provider_name(model)
+    if not provider_name:
+        raise ValueError("No provider could be matched for the configured crawler model.")
+    provider = _make_single_provider(config, provider_name, model)
+
+    from nanobot.providers.base import GenerationSettings
+
+    provider.generation = GenerationSettings(
+        temperature=0.1,
+        max_tokens=crawler.max_tokens.output,
+        reasoning_effort=crawler.reasoning_effort,
+    )
+    return provider

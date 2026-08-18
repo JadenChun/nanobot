@@ -162,3 +162,71 @@ sudo systemctl status nanobot-gateway --no-pager
 sudo journalctl -u nanobot-gateway -n 100 --no-pager
 sudo tail -n 100 /opt/marketing-agent/logs/nanobot-gateway.log
 ```
+
+To verify context-memory delivery after a scheduled run:
+
+```bash
+sudo -u marketing-agent git -C /opt/marketing-agent/client-marketing-assistance status --short --branch
+sudo -u marketing-agent git -C /opt/marketing-agent/client-marketing-assistance rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'
+sudo grep -E 'Context repo (synced successfully|sync did not complete|sync failed)' /opt/marketing-agent/logs/nanobot-gateway.log | tail -n 20
+```
+
+A successful scheduled run waits for its context sync attempt before completing.
+Interactive requests keep the sync in the background to avoid delaying the chat
+response. Confirm that the service user has non-interactive push access to the
+configured upstream; `autoSync` cannot compensate for missing GitHub credentials.
+
+## Optional Crawl4AI Worker
+
+The Crawl4AI integration keeps browser execution outside the main agent process:
+
+```text
+Nanobot orchestrator -> lower-cost foreground crawler role -> social_crawl -> Unix socket -> Crawl4AI/Chromium
+```
+
+The foreground crawler role receives rendered, cleaned HTML with links and DOM attributes intact.
+JSON is used only on the private Unix socket. The `social_crawl` tool unwraps it and gives the
+role a short session/URL preamble followed by the HTML directly. Crawl4AI does not receive
+an LLM key and does not perform reasoning itself.
+
+Install the isolated worker only after the normal gateway is healthy:
+
+```bash
+sudo bash /opt/marketing-agent/nanobot-custom/deploy/scripts/deploy_crawl4ai_worker.sh
+sudo journalctl -u crawl4ai-worker -n 100 --no-pager
+```
+
+Check it locally through its Unix socket:
+
+```bash
+sudo -u marketing-agent python3 - <<'PY'
+import json
+import socket
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect("/run/crawl4ai-worker/worker.sock")
+client.sendall(b'{"op":"health"}\n')
+print(json.loads(client.makefile().readline()))
+PY
+```
+
+Then set both controls before restarting Nanobot:
+
+1. Set `agents.crawler.enabled` to `true` in
+   `/opt/marketing-agent/.nanobot/config.json`, then choose its provider and lower-cost model.
+   If this differs from the main agent provider, configure that provider's API key too.
+2. Set `CRAWL4AI_WORKER_ENABLED=true` in
+   `/opt/marketing-agent/secrets/nanobot.env`.
+
+Finally restart the gateway:
+
+```bash
+sudo systemctl restart nanobot-gateway
+```
+
+The first rollout should keep the worker headless, logged out, and limited to the domains in
+`/etc/crawl4ai-worker/crawl4ai-worker.env`. It serializes browser actions and allows one live
+session, which is intentional for the 2 GB Lightsail instance. TikTok remains outside the
+initial scope. The worker accepts only open, inspect, CSS-selector click, scroll, wait, and
+close operations; it never accepts arbitrary JavaScript, cookies, credentials, or proxy
+settings from the agent.

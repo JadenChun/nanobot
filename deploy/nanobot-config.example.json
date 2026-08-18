@@ -16,6 +16,17 @@
           "autoSync": true
         }
       ]
+    },
+    "crawler": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "google/gemini-2.5-flash-lite",
+      "maxTokens": {
+        "input": 20000,
+        "output": 2000
+      },
+      "maxToolIterations": 20,
+      "reasoningEffort": "low"
     }
   },
   "channels": {

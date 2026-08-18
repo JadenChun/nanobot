@@ -1,0 +1,44 @@
+[Unit]
+Description=Marketing Agent Isolated Crawl4AI Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=crawl4ai-worker
+Group=marketing-agent
+WorkingDirectory=/opt/marketing-agent/nanobot-custom
+Environment=HOME=/var/lib/crawl4ai-worker
+EnvironmentFile=/etc/crawl4ai-worker/crawl4ai-worker.env
+ExecStart=/opt/marketing-agent/crawl4ai-worker/.venv/bin/nanobot-crawl-worker
+RuntimeDirectory=crawl4ai-worker
+RuntimeDirectoryMode=0770
+StateDirectory=crawl4ai-worker
+StateDirectoryMode=0750
+CacheDirectory=crawl4ai-worker
+CacheDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0007
+
+# Keep one Chromium worker bounded on the 2 GB Lightsail instance.
+MemoryHigh=900M
+MemoryMax=1200M
+TasksMax=256
+
+# The worker gets no secrets and cannot write to the application checkout.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+IPAddressDeny=169.254.169.254/32
+IPAddressDeny=fd00:ec2::254/128
+
+[Install]
+WantedBy=multi-user.target

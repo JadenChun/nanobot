@@ -84,10 +84,24 @@ class AgentDefaults(Base):
         self.max_tokens.input = value
 
 
+class CrawlerAgentConfig(Base):
+    """Dedicated low-cost model used by the foreground crawler role."""
+
+    enabled: bool = False
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: MaxTokensConfig = Field(
+        default_factory=lambda: MaxTokensConfig(input=20000, output=2000)
+    )
+    max_tool_iterations: int = Field(default=20, ge=1, le=100)
+    reasoning_effort: str | None = "low"
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    crawler: CrawlerAgentConfig = Field(default_factory=CrawlerAgentConfig)
 
 
 class ProviderConfig(Base):

@@ -117,6 +117,8 @@ Skills with available="false" need dependencies installed first - you can try in
             routes.append("- Use `plan_task` only when sequencing, dependencies, or material ambiguity make direct execution unreliable.")
         if has("delegate_task"):
             routes.append("- Use `delegate_task` for one bounded implementation or artifact package that benefits from isolated context; provide a complete Markdown contract and exact write scope.")
+        if has("crawl_research"):
+            routes.append("- Use `crawl_research` for bounded public-page research requiring rendered browser interaction.")
         if has("review_work"):
             routes.append("- Use `review_work` for important deliverables, risky changes, uncertain results, or explicit quality requests—not every routine task.")
 
@@ -226,7 +228,8 @@ Your workspace is at: {workspace_path}
                     "\nReply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.\n"
                     "IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. "
                     "Do NOT use read_file to \"send\" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. "
-                    "Example: message(content=\"Here is the file\", media=[\"/path/to/file.png\"])"
+                    "Example: message(content=\"Here is the file\", media=[\"/path/to/file.png\"])\n"
+                    "If the message tool successfully sends the complete result to the current target, do not repeat it or add a completion/status recap in your final text."
                 ),
             ),
         ]

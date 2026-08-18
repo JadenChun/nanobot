@@ -24,6 +24,7 @@ from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
 from nanobot.agent.tools.agent_device import AgentDeviceTool
+from nanobot.agent.tools.crawler import CrawlResearchTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.delegation import DelegateTaskTool, PlanTaskTool, ReviewWorkTool
 from nanobot.agent.tools.desktop_use import DesktopUseTool
@@ -36,6 +37,7 @@ from nanobot.agent.tools.image import (
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.social_crawl import crawl_tools_enabled
 from nanobot.agent.tools.trend_vpn import (
     TrendVpnBrowserFetchTool,
     TrendVpnFetchTool,
@@ -58,6 +60,7 @@ if TYPE_CHECKING:
         AgentBrowserConfig,
         AgentDeviceConfig,
         ChannelsConfig,
+        CrawlerAgentConfig,
         DesktopUseConfig,
         ExecToolConfig,
         ImageConfig,
@@ -237,10 +240,13 @@ class AgentLoop:
         tool_result_clearing_keep: int = 3,
         consolidation_trigger_ratio: float = 0.5,
         consolidation_target_ratio: float = 0.3,
+        crawler_agent_config: "CrawlerAgentConfig | None" = None,
+        crawler_provider: LLMProvider | None = None,
     ):
         from nanobot.config.schema import (
             AgentBrowserConfig,
             AgentDeviceConfig,
+            CrawlerAgentConfig,
             DesktopUseConfig,
             ExecToolConfig,
             ImageConfig,
@@ -268,6 +274,7 @@ class AgentLoop:
         self.desktop_use_config = desktop_use_config or DesktopUseConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.image_config = image_config or ImageConfig()
+        self.crawler_agent_config = crawler_agent_config or CrawlerAgentConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -330,6 +337,12 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
             mcp_servers=mcp_servers or {},
             max_parallel_explore_agents=self._DEFAULT_MAX_PARALLEL_EXPLORES,
+            crawler_provider=crawler_provider,
+            crawler_model=self.crawler_agent_config.model,
+            crawler_max_iterations=self.crawler_agent_config.max_tool_iterations,
+            crawler_max_input_tokens=self.crawler_agent_config.max_tokens.input,
+            crawler_max_output_tokens=self.crawler_agent_config.max_tokens.output,
+            crawler_reasoning_effort=self.crawler_agent_config.reasoning_effort,
             file_lock_registry=self._file_lock_registry,
         )
 
@@ -449,6 +462,8 @@ class AgentLoop:
             self.delegation,
             max_iterations=self._DEFAULT_EXPLORE_MAX_ITERATIONS,
         ))
+        if self.crawler_agent_config.enabled and crawl_tools_enabled():
+            self.tools.register(CrawlResearchTool(manager=self.delegation))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -1222,11 +1237,12 @@ class AgentLoop:
             approval_granted=approval_granted or approval_note is not None,
         )
 
+        # A successful direct send is already the user-facing result, including
+        # scheduled turns. Do not publish the model's trailing completion recap.
         if (
             (mt := self.tools.get("message"))
             and isinstance(mt, MessageTool)
             and mt._sent_in_turn
-            and not key.startswith("cron:")
         ):
             return None
 

@@ -35,10 +35,12 @@ flowchart TD
     ORCH -->|sequencing is genuinely useful| PLAN[Foreground planner]
     ORCH -->|bounded implementation package| WORK[Foreground worker]
     ORCH -->|broad read-only investigation| EXPLORE[Foreground explorer]
+    ORCH -->|rendered public-page research| CRAWL[Foreground Crawl4AI worker]
     ORCH -->|important or uncertain result| REVIEW[Foreground reviewer]
     PLAN --> ORCH
     WORK --> ORCH
     EXPLORE --> ORCH
+    CRAWL --> ORCH
     REVIEW --> ORCH
     DIRECT --> ORCH
     ORCH --> OUT([Natural user-facing response])
@@ -49,6 +51,7 @@ flowchart TD
 | **Direct** | The orchestrator uses the normal tool set and completes the task itself. |
 | **Plan / Explore** | A read-only foreground role returns evidence or an execution-ready plan. |
 | **Delegate** | One scoped foreground worker handles a bounded contract and cannot write outside its declared paths. |
+| **Crawl** | A separately configured foreground model controls the deterministic Crawl4AI worker for public-page research. |
 | **Review** | A read-only foreground reviewer checks a specific deliverable when the orchestrator decides review is warranted. |
 
 All role calls are synchronous from the orchestrator's perspective: it waits for the result, evaluates it, and decides the next step. Role output is internal evidence; the user receives a concise, natural summary rather than harness state or transcripts.

@@ -487,6 +487,30 @@ def _make_provider(config: Config):
     return fallback
 
 
+def _make_crawler_provider(config: Config):
+    """Create the optional crawler provider independently from the main agent."""
+    crawler = config.agents.crawler
+    from nanobot.agent.tools.social_crawl import crawl_tools_enabled
+
+    if not crawler.enabled or not crawl_tools_enabled():
+        return None
+    model = crawler.model or config.agents.defaults.model
+    provider_name = crawler.provider or config.get_provider_name(model)
+    if not provider_name:
+        console.print("[red]Error: No provider could be matched for the crawler model.[/red]")
+        raise typer.Exit(1)
+    provider = _make_single_provider(config, provider_name, model)
+
+    from nanobot.providers.base import GenerationSettings
+
+    provider.generation = GenerationSettings(
+        temperature=0.1,
+        max_tokens=crawler.max_tokens.output,
+        reasoning_effort=crawler.reasoning_effort,
+    )
+    return provider
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, set_config_path
@@ -586,6 +610,7 @@ def serve(
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(runtime_config)
+    crawler_provider = _make_crawler_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
     agent_loop = AgentLoop(
         bus=bus,
@@ -594,6 +619,8 @@ def serve(
         model=runtime_config.agents.defaults.model,
         max_tokens=runtime_config.agents.defaults.max_tokens,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
+        crawler_agent_config=runtime_config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=runtime_config.tools.web.search,
         web_proxy=runtime_config.tools.web.proxy or None,
         exec_config=runtime_config.tools.exec,
@@ -704,6 +731,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    crawler_provider = _make_crawler_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -722,6 +750,8 @@ def gateway(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        crawler_agent_config=config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
@@ -758,8 +788,10 @@ def gateway(
             "This is a fresh execution of this scheduled task. "
             "Execute it now — do not simply echo a status update or say 'in progress'. "
             "Complete the task directly, wait for any foreground delegated work, and deliver "
-            "the finished result before this scheduled run ends. Return the concise, complete, "
-            "user-facing result directly in your final response. Keep reports and working files "
+            "exactly one finished user-facing result before this scheduled run ends: either "
+            "send it with the message tool or return it in your final response. If the message "
+            "tool successfully sends the result to the scheduled target, do not repeat it or "
+            "send a completion recap in your final response. Keep reports and working files "
             "internal unless the scheduled instruction explicitly asks for an attachment."
         )
 
@@ -1026,6 +1058,7 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    crawler_provider = _make_crawler_provider(config)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -1068,6 +1101,8 @@ def agent(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        crawler_agent_config=config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,

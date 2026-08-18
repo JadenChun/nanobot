@@ -77,7 +77,7 @@ class TestMessageToolSuppressLogic:
         assert result.channel == "feishu"
 
     @pytest.mark.asyncio
-    async def test_cron_run_returns_final_result_after_explicit_message(self, tmp_path: Path) -> None:
+    async def test_cron_run_suppresses_final_result_after_explicit_message(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(
             id="call1",
@@ -100,8 +100,7 @@ class TestMessageToolSuppressLogic:
         result = await loop._process_message(msg, session_key="cron:daily-content")
 
         assert len(sent) == 1
-        assert result is not None
-        assert result.content == "Final scheduled result"
+        assert result is None  # explicit Telegram delivery already completed the turn
 
     @pytest.mark.asyncio
     async def test_not_suppress_when_no_message_tool_used(self, tmp_path: Path) -> None:
