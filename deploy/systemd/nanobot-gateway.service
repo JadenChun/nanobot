@@ -9,7 +9,7 @@ User=marketing-agent
 Group=marketing-agent
 WorkingDirectory=/opt/marketing-agent/client-marketing-assistance
 Environment=PYTHONUNBUFFERED=1
-Environment=AGENT_VPN_BROKER_ENABLED=true
+Environment=AGENT_VPN_BROKER_ENABLED=false
 EnvironmentFile=/opt/marketing-agent/secrets/nanobot.env
 ExecStart=/opt/marketing-agent/nanobot-custom/.venv/bin/nanobot gateway --config /opt/marketing-agent/.nanobot/config.json --log-file /opt/marketing-agent/logs/nanobot-gateway.log
 Restart=on-failure
