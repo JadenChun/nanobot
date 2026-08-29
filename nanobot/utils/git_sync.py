@@ -8,8 +8,11 @@ from fnmatch import fnmatch
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
+
+from nanobot.utils.secret_scan import find_secrets_in_blob
 
 
 @dataclass(frozen=True)
@@ -259,6 +262,109 @@ def _abort_interrupted_rebase(repo: Path) -> None:
         logger.error("Context repo git rebase --abort failed: {}", _git_output(abort))
 
 
+def _ahead_commit_summaries(repo: Path, upstream: str) -> list[dict[str, Any]]:
+    """Return one summary per commit in upstream..HEAD with hash and paths.
+
+    Each item has keys: ``sha`` (full), ``short`` (7-char), ``paths`` (list of
+    relative paths touched by the commit), ``subject``.
+    """
+    fmt = "%H%x1f%h%x1f%s%x1f"
+    result = _run_git(
+        repo,
+        "log",
+        f"{upstream}..HEAD",
+        "--pretty=format:" + fmt,
+        "--name-only",
+        timeout=60,
+    )
+    if result.returncode != 0:
+        logger.error("Context repo ahead-commit log failed: {}", _git_output(result))
+        return []
+    summaries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        if "\x1f" in line:
+            if current is not None:
+                summaries.append(current)
+            sha, short, subject = line.split("\x1f", 2)
+            current = {
+                "sha": sha.strip(),
+                "short": short.strip(),
+                "subject": subject.strip(),
+                "paths": [],
+            }
+        else:
+            if current is not None:
+                p = line.strip()
+                if p:
+                    current["paths"].append(p)
+    if current is not None:
+        summaries.append(current)
+    return summaries
+
+
+def _commit_blob(repo: Path, sha: str, path: str) -> str | None:
+    """Return the blob text for one path in a given commit, or None if absent."""
+    result = _run_git(repo, "show", f"{sha}:{path}", timeout=30)
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _validate_ahead_commits(
+    repo: Path,
+    *,
+    upstream: str,
+    include_paths: list[str] | None,
+    exclude_paths: list[str] | None,
+) -> tuple[bool, list[str]]:
+    """Inspect every local-ahead commit. Return (ok, error_lines).
+
+    Each commit must:
+        1. Touch only paths that match the include list (or all paths if
+           include is None) AND do not match the exclude list.
+        2. Have blob content free of probable credentials.
+
+    Error lines describe ONLY the offending path, commit short-hash, and
+    redacted fingerprint. Full credential values are never written.
+    """
+    summaries = _ahead_commit_summaries(repo, upstream)
+    errors: list[str] = []
+    for summary in summaries:
+        commit = summary["short"]
+        # 1. Path policy
+        for path in summary["paths"]:
+            allowed = (
+                include_paths is None
+                or _matches(path, include_paths)
+            )
+            excluded = bool(exclude_paths) and _matches(path, exclude_paths)
+            if not allowed or excluded:
+                errors.append(
+                    f"commit {commit} contains prohibited path {path}"
+                )
+                # No need to scan the blob if the path is already disallowed.
+                continue
+            # 2. Secret content policy
+            blob = _commit_blob(repo, summary["sha"], path)
+            if blob is None:
+                continue
+            for hit in find_secrets_in_blob(blob):
+                errors.append(
+                    "commit {commit} contains probable {kind} credential "
+                    "in {path} (fingerprint: {fp}, field: {field})".format(
+                        commit=commit,
+                        kind=hit["kind"],
+                        path=path,
+                        fp=hit["fingerprint"],
+                        field=hit["field"],
+                    )
+                )
+    return (len(errors) == 0, errors)
+
+
 def sync_context_repo(
     repo: Path,
     *,
@@ -269,6 +375,12 @@ def sync_context_repo(
     """Commit and push any changes in the context repo.
 
     Returns True if sync succeeded (or nothing to sync), False on failure.
+
+    The push safety check is based on the actual content and path list of the
+    local-ahead commits (upstream..HEAD), not on the current working-tree
+    state. Once a managed change has been committed, an empty working-tree
+    ``selected_paths`` is normal and must NOT block the push of a valid
+    commit.
     """
     if not is_git_repo(repo):
         logger.debug("Context path is not a git repo, skipping sync: {}", repo)
@@ -287,50 +399,85 @@ def sync_context_repo(
         return False
 
     if not has_changes(repo):
-        logger.debug("No changes in context repo: {}", repo)
-        return True
+        logger.debug("No working-tree changes in context repo: {}", repo)
 
     selected_paths = _select_changed_paths(repo, include_paths, exclude_paths)
-    if not selected_paths:
-        logger.debug("No selected changes in context repo: {}", repo)
-        return True
 
     try:
-        committed_selected_paths = list(selected_paths)
-        committed_snapshots = _snapshot_paths(repo, committed_selected_paths)
-
-        # Stage and commit only selected changes for managed context repos.
-        if not _commit_selected_paths(repo, selected_paths, message):
+        # Commit managed working-tree changes (if any) so the local-ahead
+        # range covers them. The ahead-commit validation below then applies
+        # the same policy to the resulting ahead commits.
+        if selected_paths and not _commit_selected_paths(
+            repo, selected_paths, message
+        ):
             return False
 
-        # Push with retry; re-sync before every push attempt so remote updates are
-        # rebased before pushing.
+        # The push safety decision is now based on the actual ahead-commit
+        # content + path policy, evaluated AFTER each sync_with_remote attempt
+        # so remote advancement is re-validated. This runs whether or not
+        # the working tree had a change to commit -- an operator may have
+        # made a local commit on a different machine and a prior sync run
+        # left an unsafe commit unpushed.
+        upstream = _upstream_ref(repo)
+        if not upstream:
+            return False
+
+        # If the working tree was clean, there are no ahead commits either
+        # (otherwise the previous sync would have either pushed them or
+        # refused the push). In that case, there is nothing to do.
+        if not selected_paths:
+            # Verify there are no pre-existing ahead commits from prior runs.
+            existing = _ahead_commit_summaries(repo, upstream)
+            if not existing:
+                logger.debug("No selected changes in context repo: {}", repo)
+                return True
+            # Fall through: existing ahead commits still need to be pushed
+            # (or refused) per the safety policy.
+
         for attempt in range(4):
-            selected_paths = _select_changed_paths(repo, include_paths, exclude_paths)
-            replay_paths = selected_paths or committed_selected_paths
+            # Re-sync with remote, then recompute and re-validate ahead commits.
             if not sync_with_remote_reapplying_changes(
                 repo,
-                selected_paths=replay_paths,
-                all_changed_paths=_changed_paths(repo) or committed_selected_paths,
-                snapshots=(
-                    _snapshot_paths(repo, selected_paths)
-                    if selected_paths
-                    else committed_snapshots
-                ),
+                selected_paths=selected_paths,
+                all_changed_paths=_changed_paths(repo) or all_changed_paths,
+                snapshots=_snapshot_paths(repo, selected_paths),
             ):
                 return False
-            if has_changes(repo):
-                selected_paths = _select_changed_paths(repo, include_paths, exclude_paths)
-                if not selected_paths:
-                    logger.error("Context repo recovery left only unselected changes; refusing to push")
-                    return False
-                if not _commit_selected_paths(repo, selected_paths, message):
-                    return False
+
+            # The recovery path inside sync_with_remote_reapplying_changes may
+            # have left managed files dirty on disk (after a rebase conflict
+            # was reset and snapshots were restored). Re-commit them so the
+            # local-ahead range is non-empty for the safety check below. This
+            # preserves the unselected dirty files: only the managed files
+            # are staged and committed.
+            current_selected = _select_changed_paths(
+                repo, include_paths, exclude_paths
+            )
+            if current_selected and not _commit_selected_paths(
+                repo, current_selected, message
+            ):
+                return False
+
+            ok, errors = _validate_ahead_commits(
+                repo,
+                upstream=upstream,
+                include_paths=include_paths,
+                exclude_paths=exclude_paths,
+            )
+            if not ok:
+                for line in errors:
+                    logger.error("Context repo push refused: {}", line)
+                return False
+
             push = _run_git(repo, "push", timeout=60)
             if push.returncode == 0:
                 logger.info("Context repo synced successfully: {}", repo)
                 return True
-            logger.warning("Context repo push attempt {} failed: {}", attempt + 1, _git_output(push))
+            logger.warning(
+                "Context repo push attempt {} failed: {}",
+                attempt + 1,
+                _git_output(push),
+            )
             if attempt < 3:
                 import time
                 time.sleep(2 ** (attempt + 1))

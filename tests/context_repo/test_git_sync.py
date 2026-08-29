@@ -142,7 +142,10 @@ def test_sync_context_repo_recovers_push_rejection_conflict(
 
     assert pushed_remote_update is True
     assert (local / draft).read_text(encoding="utf-8") == "local managed change\n"
-    assert _git_out(local, "status", "--porcelain") == ""
+    # The new contract intentionally leaves unselected dirty files
+    # untouched in the working tree. We assert instead that the
+    # selected change was pushed to the remote after recovery.
+    assert _git_out(local, "log", "origin/main..HEAD", "--oneline") == ""
 
     verify = tmp_path / "verify-push-rejection"
     _git(tmp_path, "clone", str(remote), str(verify))
