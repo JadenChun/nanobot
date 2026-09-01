@@ -1,17 +1,19 @@
 import json
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
+from nanobot.agent.turn import TurnResult
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import _execute_cron_job, _make_provider, app
 from nanobot.config.schema import Config, FallbackEntry
 from nanobot.providers.fallback_provider import FallbackProvider
-from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
+from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.registry import find_by_name
 
 runner = CliRunner()
@@ -19,11 +21,6 @@ runner = CliRunner()
 
 class _StopGatewayError(RuntimeError):
     pass
-
-
-import shutil
-
-import pytest
 
 
 @pytest.fixture
@@ -499,8 +496,8 @@ def mock_agent_runtime(tmp_path):
 
         agent_loop = MagicMock()
         agent_loop.channels_config = None
-        agent_loop.process_direct = AsyncMock(
-            return_value=OutboundMessage(channel="cli", chat_id="direct", content="mock-response"),
+        agent_loop.execute_turn = AsyncMock(
+            return_value=TurnResult(content="mock-response", final_content="mock-response"),
         )
         agent_loop.close_mcp = AsyncMock(return_value=None)
         mock_agent_loop_cls.return_value = agent_loop
@@ -537,7 +534,7 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == (
         mock_agent_runtime["config"].workspace_path
     )
-    mock_agent_runtime["agent_loop"].process_direct.assert_awaited_once()
+    mock_agent_runtime["agent_loop"].execute_turn.assert_awaited_once()
     mock_agent_runtime["print_response"].assert_called_once_with(
         "mock-response", render_markdown=True, metadata={},
     )
@@ -553,6 +550,30 @@ def test_agent_logs_flag_prints_explicit_runtime_logs_banner(mock_agent_runtime)
     stripped_output = _strip_ansi(result.stdout)
     assert "Runtime logs enabled (--logs)." in stripped_output
     assert "Use --no-logs to hide internal logs." in stripped_output
+
+
+def test_agent_log_file_adds_rotating_file_sink(mock_agent_runtime, tmp_path: Path):
+    log_path = tmp_path / "agent.log"
+    with patch("loguru.logger.remove"), \
+         patch("loguru.logger.add") as add_log, \
+         patch("loguru.logger.enable"):
+        result = runner.invoke(
+            app,
+            ["agent", "-m", "hello", "--log-file", str(log_path)],
+        )
+
+    assert result.exit_code == 0
+    add_log.assert_called_once_with(
+        str(log_path),
+        rotation="20 MB",
+        retention="7 days",
+        compression="gz",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        enqueue=True,
+    )
+    output = _strip_ansi(result.stdout)
+    assert "Logging to" in output
+    assert "agent.log" in output
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
@@ -587,8 +608,8 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_direct(self, *_args, **_kwargs):
-            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+        async def execute_turn(self, *_args, **_kwargs):
+            return TurnResult(content="ok", final_content="ok")
 
         async def close_mcp(self) -> None:
             return None
@@ -625,8 +646,8 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_direct(self, *_args, **_kwargs):
-            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+        async def execute_turn(self, *_args, **_kwargs):
+            return TurnResult(content="ok", final_content="ok")
 
         async def close_mcp(self) -> None:
             return None
@@ -672,8 +693,8 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_direct(self, *_args, **_kwargs):
-            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+        async def execute_turn(self, *_args, **_kwargs):
+            return TurnResult(content="ok", final_content="ok")
 
         async def close_mcp(self) -> None:
             return None
@@ -725,8 +746,8 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_direct(self, *_args, **_kwargs):
-            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+        async def execute_turn(self, *_args, **_kwargs):
+            return TurnResult(content="ok", final_content="ok")
 
         async def close_mcp(self) -> None:
             return None
@@ -786,6 +807,130 @@ def test_heartbeat_retains_recent_messages_by_default():
     config = Config()
 
     assert config.gateway.heartbeat.keep_recent_messages == 8
+
+
+@pytest.mark.asyncio
+async def test_cron_execution_uses_fresh_detail_and_links_exact_visible_pair(tmp_path: Path) -> None:
+    from nanobot.agent.turn import HistoryMode, TurnRequest, TurnResult, TurnSource
+    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+    from nanobot.session.manager import SessionManager
+
+    sessions = SessionManager(tmp_path)
+    detail = sessions.get_or_create("cron:job-1")
+    detail.add_run_message("old-run", "user", "older instruction")
+    detail.add_run_message("old-run", "assistant", "older result")
+    sessions.save(detail)
+
+    class _Agent:
+        def __init__(self) -> None:
+            self.sessions = sessions
+            self.tools = MagicMock()
+            self.execute_turn = AsyncMock(return_value=TurnResult(
+                run_id="new-run",
+                content="finished report",
+                final_content="finished report",
+            ))
+
+    agent = _Agent()
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    job = CronJob(
+        id="job-1",
+        name="daily report",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            message="Generate the daily report",
+            deliver=True,
+            channel="telegram",
+            to="chat-1",
+        ),
+    )
+
+    result = await _execute_cron_job(agent, bus, job)
+
+    request = agent.execute_turn.await_args.args[0]
+    assert isinstance(request, TurnRequest)
+    assert request.source is TurnSource.CRON
+    assert request.session_key == "cron:job-1"
+    assert request.history_mode is HistoryMode.FRESH
+    assert request.scheduled_link is not None
+    assert request.scheduled_link.instruction == "Generate the daily report"
+    assert request.scheduled_link.visible_session_key == "telegram:chat-1"
+    assert request.callbacks.on_progress is not None
+    await request.callbacks.on_progress("interim tool hint", tool_hint=True)
+    assert result.run_id == "new-run"
+
+    detail = sessions.get_or_create("cron:job-1")
+    assert [message["content"] for message in detail.get_run_messages("old-run")] == [
+        "older instruction",
+        "older result",
+    ]
+    visible = sessions.get_or_create("telegram:chat-1")
+    linked = visible.get_run_messages("new-run")
+    assert [(message["role"], message["content"]) for message in linked] == [
+        ("user", "Generate the daily report"),
+        ("assistant", "finished report"),
+    ]
+    assert [(message["role"], message["content"]) for message in visible.get_history()[-2:]] == [
+        ("user", "Generate the daily report"),
+        ("assistant", "finished report"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cron_empty_canonical_ledger_ignores_stale_message_tool_delivery(tmp_path: Path) -> None:
+    from nanobot.agent.tools.message import MessageTool
+    from nanobot.agent.turn import TurnResult
+    from nanobot.cron.types import CronDestination, CronJob, CronPayload, CronSchedule
+    from nanobot.session.manager import SessionManager
+
+    sessions = SessionManager(tmp_path)
+    stale_send = AsyncMock()
+    message_tool = MessageTool(
+        send_callback=stale_send,
+        default_channel="telegram",
+        default_chat_id="primary",
+    )
+    message_tool.start_turn()
+    await message_tool.execute("finished report")
+    assert len(message_tool.sent_messages_in_turn) == 1
+    assert message_tool.sent_messages_in_turn[0].content == "finished report"
+
+    class _Agent:
+        def __init__(self) -> None:
+            self.sessions = sessions
+            self.tools = MagicMock()
+            self.tools.get.return_value = message_tool
+            self.execute_turn = AsyncMock(return_value=TurnResult(
+                run_id="cron-run",
+                content="finished report",
+                final_content="finished report",
+                sent_messages=(),
+            ))
+
+    agent = _Agent()
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    job = CronJob(
+        id="job-stale-ledger",
+        name="daily report",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(
+            message="Generate the daily report",
+            deliver=True,
+            channel="telegram",
+            to="primary",
+            additional_destinations=[CronDestination("discord", "secondary")],
+        ),
+    )
+
+    await _execute_cron_job(agent, bus, job)
+
+    published = [call.args[0] for call in bus.publish_outbound.await_args_list]
+    assert published == [
+        OutboundMessage("telegram", "primary", "finished report"),
+        OutboundMessage("discord", "secondary", "finished report"),
+    ]
 
 
 def _write_instance_config(tmp_path: Path) -> Path:

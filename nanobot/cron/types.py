@@ -37,9 +37,6 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     # Additional result destinations. channel/to remains the execution context.
     additional_destinations: list[CronDestination] = field(default_factory=list)
-    # Per-job overrides for the agent loop
-    planning_mode: Literal["on", "off", "agent"] | None = None  # None = use global default
-    skip_verification: bool = False
 
     def delivery_destinations(self) -> list[CronDestination]:
         """Return de-duplicated primary and additional result destinations."""
@@ -69,6 +66,14 @@ class CronRunRecord:
     status: Literal["ok", "error", "skipped"]
     duration_ms: int = 0
     error: str | None = None
+    # Canonical agent-turn identifier.  ``None`` keeps older persisted stores
+    # and third-party callbacks source-compatible.
+    run_id: str | None = None
+    # Canonical turn lifecycle status, retained alongside the historical
+    # coarse ``ok/error/skipped`` compatibility field.
+    run_status: str | None = None
+    # Stable execution occurrence identifier (normally the execution start ms).
+    occurrence_id: str | None = None
 
 
 @dataclass
@@ -77,6 +82,7 @@ class CronJobState:
     next_run_at_ms: int | None = None
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
+    last_run_status: str | None = None
     last_error: str | None = None
     run_history: list[CronRunRecord] = field(default_factory=list)
 

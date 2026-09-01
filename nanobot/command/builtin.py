@@ -13,7 +13,7 @@ from nanobot.utils.helpers import build_status_content
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
-    """Cancel all active tasks and subagents for the session."""
+    """Cancel active processing for the session."""
     loop = ctx.loop
     msg = ctx.msg
     tasks = loop._active_tasks.pop(msg.session_key, [])
@@ -23,8 +23,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
             await t
         except (asyncio.CancelledError, Exception):
             pass
-    sub_cancelled = await loop.subagents.cancel_by_session(msg.session_key)
-    total = cancelled + sub_cancelled
+    total = cancelled
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     if total:
         loop.record_task_cancellation(
@@ -32,7 +31,6 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
             channel=msg.channel,
             chat_id=msg.chat_id,
             active_tasks=cancelled,
-            subagent_tasks=sub_cancelled,
         )
     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
@@ -96,11 +94,25 @@ async def cmd_quota(ctx: CommandContext) -> OutboundMessage:
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    snapshot = session.messages[session.last_consolidated:]
-    session.clear()
-    loop.sessions.save(session)
-    loop.sessions.invalidate(session.key)
+    from nanobot.session.manager import SessionWriteConflict
+
+    snapshot: list[dict] = []
+    for _attempt in range(3):
+        session = (
+            (ctx.session if _attempt == 0 and ctx.session is not None else None)
+            or loop.sessions.get_or_create(ctx.key)
+        )
+        snapshot = [dict(message) for message in session.messages[session.last_consolidated:]]
+        session.clear(expected_revision=session.revision)
+        try:
+            loop.sessions.save(session)
+            loop.sessions.invalidate(session.key)
+            break
+        except SessionWriteConflict:
+            loop.sessions.invalidate(ctx.key)
+    else:
+        # Preserve the content-free conflict contract after bounded retries.
+        raise SessionWriteConflict()
     if snapshot:
         loop._schedule_background(loop.memory_consolidator.archive_messages(snapshot))
     return OutboundMessage(

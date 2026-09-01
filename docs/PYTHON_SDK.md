@@ -29,7 +29,7 @@ Create a `Nanobot` from a config file.
 
 Raises `FileNotFoundError` if an explicit path doesn't exist.
 
-### `await bot.run(message, *, session_key?, hooks?)`
+### `await bot.run(message, *, session_key?, hooks?, include_messages?)`
 
 Run the agent once. Returns a `RunResult`.
 
@@ -38,6 +38,7 @@ Run the agent once. Returns a `RunResult`.
 | `message` | `str` | *(required)* | The user message to process. |
 | `session_key` | `str` | `"sdk:default"` | Session identifier for conversation isolation. Different keys get independent history. |
 | `hooks` | `list[AgentHook] \| None` | `None` | Lifecycle hooks for this run only. |
+| `include_messages` | `bool` | `False` | Opt into a detached, sanitized execution trace. |
 
 ```python
 # Isolated sessions — each user gets independent conversation history
@@ -51,7 +52,15 @@ await bot.run("hi", session_key="user-bob")
 |-------|------|-------------|
 | `content` | `str` | The agent's final text response. |
 | `tools_used` | `list[str]` | Tool names invoked during the run. |
-| `messages` | `list[dict]` | Raw message history (for debugging). |
+| `messages` | `list[dict]` | `[]` by default; sanitized trace entries only when `include_messages=True`. |
+| `run_id` | `str \| None` | Canonical identifier for this execution, when available. |
+| `stop_reason` | `str \| None` | Terminal reason such as `completed`, `approval_required`, or `max_iterations`. |
+
+`tools_used`, `run_id`, and `stop_reason` come directly from the canonical turn
+result. SDK hooks are attached to that request only; concurrent calls do not
+share or overwrite hook state. The opt-in `messages` trace omits system
+prompts, internal metadata, media payloads, and tool-call arguments, and is
+detached from the loop's mutable history.
 
 ## Hooks
 

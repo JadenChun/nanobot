@@ -80,3 +80,26 @@ def test_explicit_fanout_does_not_duplicate_an_existing_send() -> None:
     ]
 
     assert build_explicit_fanout_messages(destinations, sent) == []
+
+
+def test_attachment_only_primary_send_does_not_suppress_final_text() -> None:
+    destination = CronDestination(channel="telegram", to="6344587670")
+    sent = [OutboundMessage(
+        "telegram",
+        "6344587670",
+        "",
+        media=["/tmp/report.pdf"],
+    )]
+
+    assert build_result_messages("The report is ready", [destination], sent) == [
+        OutboundMessage("telegram", "6344587670", "The report is ready"),
+    ]
+
+
+def test_auxiliary_text_send_does_not_suppress_different_final_text() -> None:
+    destination = CronDestination(channel="telegram", to="6344587670")
+    sent = [OutboundMessage("telegram", "6344587670", "Attachment uploaded")]
+
+    assert build_result_messages("The report is ready", [destination], sent) == [
+        OutboundMessage("telegram", "6344587670", "The report is ready"),
+    ]

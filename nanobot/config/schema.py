@@ -23,7 +23,7 @@ class ChannelsConfig(Base):
 
     model_config = ConfigDict(extra="allow")
 
-    task_update_mode: Literal["result", "plan_result", "verbose"] = "verbose"
+    task_update_mode: Literal["result", "verbose"] = "verbose"
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
 
@@ -65,11 +65,7 @@ class AgentDefaults(Base):
     max_tokens: MaxTokensConfig = Field(default_factory=MaxTokensConfig)
     temperature: float = 0.1
     max_tool_iterations: int = 200
-    planner_max_iterations: int = 12
-    planner_explore_subagent_max_iterations: int = 100
-    planner_max_parallel_explore_agents: int = 2
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
-    planning_mode: Literal["on", "off", "agent"] = "agent"  # "on": always use spawn+review, "off": never, "agent": agent decides
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     context_paths: list[str] = Field(default_factory=list)  # Paths to local context repos (e.g. git repos with memory, skills, bootstrap files)
     context_repos: list[str | ContextRepoConfig] = Field(default_factory=list)  # Managed context repos; string paths auto-detect nanobot.context.json.
@@ -88,10 +84,24 @@ class AgentDefaults(Base):
         self.max_tokens.input = value
 
 
+class CrawlerAgentConfig(Base):
+    """Dedicated low-cost model used by the foreground crawler role."""
+
+    enabled: bool = False
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: MaxTokensConfig = Field(
+        default_factory=lambda: MaxTokensConfig(input=20000, output=2000)
+    )
+    max_tool_iterations: int = Field(default=20, ge=1, le=100)
+    reasoning_effort: str | None = "low"
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    crawler: CrawlerAgentConfig = Field(default_factory=CrawlerAgentConfig)
 
 
 class ProviderConfig(Base):

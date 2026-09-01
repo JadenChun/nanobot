@@ -1,12 +1,13 @@
 """File system tools: read, write, edit, list."""
 
+import contextvars
 import difflib
 import mimetypes
-import contextvars
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import TurnContext
 from nanobot.agent.write_guard import FileLockRegistry, WriteScope, _is_under
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 
@@ -106,6 +107,15 @@ class _FsTool(Tool):
     def set_lock_owner(self, owner: str) -> None:
         self._lock_owner = owner
         self._lock_owner_var.set(owner)
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        """Use the current turn's lock owner without mutating shared tool state."""
+        owner = context.lock_owner or self._lock_owner
+        token = self._lock_owner_var.set(owner)
+        try:
+            return await self.execute(**kwargs)
+        finally:
+            self._lock_owner_var.reset(token)
 
     def _write_scope_error(self, path: Path) -> str | None:
         if not self._allowed_write_scope:
@@ -298,13 +308,13 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     old_lines = old_text.splitlines()
     if not old_lines:
         return None, 0
-    stripped_old = [l.strip() for l in old_lines]
+    stripped_old = [line.strip() for line in old_lines]
     content_lines = content.splitlines()
 
     candidates = []
     for i in range(len(content_lines) - len(stripped_old) + 1):
         window = content_lines[i : i + len(stripped_old)]
-        if [l.strip() for l in window] == stripped_old:
+        if [line.strip() for line in window] == stripped_old:
             candidates.append("\n".join(window))
 
     if candidates:
@@ -515,3 +525,188 @@ class ListDirTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
+
+
+# ---------------------------------------------------------------------------
+# search_files
+# ---------------------------------------------------------------------------
+
+class SearchFilesTool(_FsTool):
+    """Search bounded UTF-8 repository text without invoking a shell."""
+
+    _DEFAULT_MAX_RESULTS = 100
+    _MAX_RESULTS = 500
+    _DEFAULT_MAX_OUTPUT_CHARS = 20_000
+    _MAX_OUTPUT_CHARS = 50_000
+    _MAX_QUERY_CHARS = 500
+    _MAX_FILE_BYTES = 2_000_000
+    _MAX_LINE_CHARS = 2_000
+
+    @property
+    def name(self) -> str:
+        return "search_files"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search UTF-8 text files under a workspace or permitted context-repository path. "
+            "Search is literal, bounded, read-only, and skips protected, binary, and common "
+            "dependency/cache directories."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Literal text to find (not a shell or regular expression).",
+                    "minLength": 1,
+                    "maxLength": self._MAX_QUERY_CHARS,
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory below the workspace or permitted context root.",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Whether matching respects letter case (default false).",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum matching lines to return (default 100, max 500).",
+                    "minimum": 1,
+                    "maximum": self._MAX_RESULTS,
+                },
+                "max_output_chars": {
+                    "type": "integer",
+                    "description": "Maximum response size (default 20,000, max 50,000).",
+                    "minimum": 1_000,
+                    "maximum": self._MAX_OUTPUT_CHARS,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+    async def execute(
+        self,
+        query: str | None = None,
+        path: str = ".",
+        case_sensitive: bool = False,
+        max_results: int | None = None,
+        max_output_chars: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Return bounded ``path:line: text`` matches, never modifying files."""
+        try:
+            if not isinstance(query, str) or not query:
+                return "Error: search query must be a non-empty string"
+            if len(query) > self._MAX_QUERY_CHARS:
+                return f"Error: search query exceeds {self._MAX_QUERY_CHARS} characters"
+            if not isinstance(path, str) or not path:
+                return "Error: search path must be a non-empty directory path"
+
+            root = self._resolve(path, "list")
+            if not root.exists():
+                return f"Error: Directory not found: {path}"
+            if not root.is_dir():
+                return f"Error: Not a directory: {path}"
+
+            result_limit = max_results or self._DEFAULT_MAX_RESULTS
+            if isinstance(result_limit, bool) or not isinstance(result_limit, int):
+                return "Error: max_results must be an integer"
+            result_limit = max(1, min(result_limit, self._MAX_RESULTS))
+            output_limit = max_output_chars or self._DEFAULT_MAX_OUTPUT_CHARS
+            if isinstance(output_limit, bool) or not isinstance(output_limit, int):
+                return "Error: max_output_chars must be an integer"
+            output_limit = max(1_000, min(output_limit, self._MAX_OUTPUT_CHARS))
+            needle = query if case_sensitive else query.casefold()
+            matches: list[str] = []
+            total_matches = 0
+
+            for candidate in self._iter_files(root):
+                if total_matches > result_limit:
+                    break
+                try:
+                    # Resolve and validate every candidate rather than relying
+                    # solely on the root check. This enforces context-repo
+                    # readable/protected patterns during traversal as well.
+                    readable = self._resolve(str(candidate), "read")
+                    if readable != candidate:
+                        candidate = readable
+                    raw = candidate.read_bytes()
+                    if len(raw) > self._MAX_FILE_BYTES or b"\x00" in raw[:8192]:
+                        continue
+                    text = raw.decode("utf-8")
+                except (OSError, UnicodeDecodeError, PermissionError):
+                    continue
+
+                for line_number, line in enumerate(text.splitlines(), start=1):
+                    haystack = line if case_sensitive else line.casefold()
+                    if needle not in haystack:
+                        continue
+                    total_matches += 1
+                    if len(matches) < result_limit:
+                        try:
+                            relative = candidate.relative_to(root)
+                        except ValueError:
+                            relative = candidate.name
+                        display = line[: self._MAX_LINE_CHARS]
+                        if len(line) > self._MAX_LINE_CHARS:
+                            display += "..."
+                        matches.append(f"{relative}:{line_number}: {display}")
+                    if total_matches > result_limit:
+                        break
+
+            if not matches:
+                return f"No matches for {query!r} under {path}"
+
+            result = "\n".join(matches)
+            if total_matches > result_limit:
+                result += (
+                    f"\n\n(truncated, showing first {result_limit} matches; "
+                    "increase max_results to inspect more)"
+                )
+            if len(result) > output_limit:
+                result = result[:output_limit].rstrip()
+                result += f"\n\n(output truncated at {output_limit} characters)"
+            return result
+        except PermissionError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            return f"Error searching files: {exc}"
+
+    def _iter_files(self, root: Path):
+        """Yield regular files while refusing symlinks and ignored directories."""
+        pending = [root]
+        ignored = ListDirTool._IGNORE_DIRS
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = sorted(directory.iterdir(), key=lambda item: item.name)
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_symlink() or entry.name in ignored or _is_blocked(entry):
+                    continue
+                if self._is_hidden(entry):
+                    continue
+                try:
+                    if entry.is_dir():
+                        pending.append(entry)
+                    elif entry.is_file():
+                        yield entry
+                except OSError:
+                    continue
+
+
+__all__ = [
+    "EditFileTool",
+    "ListDirTool",
+    "ReadFileTool",
+    "SearchFilesTool",
+    "WriteFileTool",
+    "_find_match",
+]

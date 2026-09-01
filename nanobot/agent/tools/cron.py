@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import ToolOutcome, TurnContext, TurnSource
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronDestination, CronJobState, CronSchedule
 
@@ -97,15 +98,6 @@ class CronTool(Tool):
                         f"(e.g. '2026-02-12T10:30:00'). Naive values default to {self._default_timezone}."
                     ),
                 },
-                "planning_mode": {
-                    "type": "string",
-                    "enum": ["on", "off", "agent"],
-                    "description": "Override planning mode for this job: 'on' (always plan), 'off' (skip planner), 'agent' (agent decides). Default: use global setting.",
-                },
-                "skip_verification": {
-                    "type": "boolean",
-                    "description": "Skip the verification phase after action execution. Default: false.",
-                },
                 "additional_destinations": {
                     "type": "array",
                     "items": {
@@ -135,8 +127,6 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         additional_destinations: list[dict[str, str]] | None = None,
         **kwargs: Any,
     ) -> str:
@@ -149,15 +139,60 @@ class CronTool(Tool):
                 cron_expr,
                 tz,
                 at,
-                planning_mode,
-                skip_verification,
                 additional_destinations,
+                channel=self._channel,
+                chat_id=self._chat_id,
             )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
+
+    async def execute_with_context(
+        self,
+        context: TurnContext,
+        action: str,
+        message: str = "",
+        every_seconds: int | None = None,
+        cron_expr: str | None = None,
+        tz: str | None = None,
+        at: str | None = None,
+        job_id: str | None = None,
+        additional_destinations: list[dict[str, str]] | None = None,
+        **kwargs: Any,
+    ) -> ToolOutcome:
+        """Execute using the current turn's route and origin.
+
+        Cron callbacks historically configured this tool by mutating a shared
+        instance.  Canonical turns instead resolve the primary destination and
+        nested-scheduling rule from their immutable request/context.
+        """
+        target = context.delivery.primary or context.delivery.target
+        channel = target.channel if target else ""
+        chat_id = target.chat_id or target.to or target.recipient if target else ""
+        if action == "add":
+            if context.source is TurnSource.CRON or self._in_cron_context.get():
+                return ToolOutcome(
+                    content="Error: cannot schedule new jobs from within a cron job execution"
+                )
+            return ToolOutcome(
+                content=self._add_job(
+                    message,
+                    every_seconds,
+                    cron_expr,
+                    tz,
+                    at,
+                    additional_destinations,
+                    channel=channel,
+                    chat_id=chat_id,
+                )
+            )
+        if action == "list":
+            return ToolOutcome(content=self._list_jobs())
+        if action == "remove":
+            return ToolOutcome(content=self._remove_job(job_id))
+        return ToolOutcome(content=f"Unknown action: {action}")
 
     def _add_job(
         self,
@@ -166,13 +201,16 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         additional_destinations: list[dict[str, str]] | None = None,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        channel = channel or self._channel
+        chat_id = chat_id or self._chat_id
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
@@ -210,23 +248,23 @@ class CronTool(Tool):
         for destination in additional_destinations or []:
             if not isinstance(destination, dict):
                 return "Error: each additional destination must be an object"
-            channel = str(destination.get("channel") or "").strip()
-            target = str(destination.get("to") or "").strip()
-            if not channel or not target:
+            destination_channel = str(destination.get("channel") or "").strip()
+            destination_target = str(destination.get("to") or "").strip()
+            if not destination_channel or not destination_target:
                 return "Error: each additional destination requires channel and to"
-            destinations.append(CronDestination(channel=channel, to=target))
+            destinations.append(
+                CronDestination(channel=destination_channel, to=destination_target)
+            )
 
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
             message=message,
             deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
+            channel=channel,
+            to=chat_id,
             additional_destinations=destinations,
             delete_after_run=delete_after,
-            planning_mode=planning_mode,
-            skip_verification=skip_verification,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

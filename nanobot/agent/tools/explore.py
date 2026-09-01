@@ -1,10 +1,11 @@
-"""Planner-only explore tool backed by foreground read-only subagents."""
+"""Foreground read-only exploration tool for the main orchestrator."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import ToolOutcome, TurnContext
 
 
 class ExploreTool(Tool):
@@ -12,8 +13,8 @@ class ExploreTool(Tool):
 
     name = "explore"
     description = (
-        "Launch a foreground read-only explore subagent for broad or repeated investigation "
-        "without filling the planner context with raw search history. Use this only when "
+        "Launch a foreground read-only exploration role for broad or repeated investigation "
+        "without filling the main context with raw search history. Use this only when "
         "simple direct read/search tools are insufficient."
     )
     parameters = {
@@ -21,7 +22,7 @@ class ExploreTool(Tool):
         "properties": {
             "task": {
                 "type": "string",
-                "description": "Specific research task for the explore subagent.",
+                "description": "Specific research task for the exploration role.",
                 "minLength": 3,
             },
             "thoroughness": {
@@ -50,6 +51,26 @@ class ExploreTool(Tool):
             thoroughness=thoroughness,
             max_iterations=self._max_iterations,
         )
+
+        if isinstance(result, ToolOutcome):
+            return result
+
+        return self._format_result(result)
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        result = await self._manager.run_explore(
+            task=kwargs.get("task", ""),
+            thoroughness=kwargs.get("thoroughness", "medium"),
+            max_iterations=self._max_iterations,
+            turn_context=context,
+        )
+        if isinstance(result, ToolOutcome):
+            return result
+        return self._format_result(result)
+
+    @staticmethod
+    def _format_result(result: dict[str, Any]) -> str:
+        """Render normal exploration findings for the outer model."""
 
         lines: list[str] = ["[Explore Findings]"]
         if result.get("partial"):

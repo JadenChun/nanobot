@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
+from nanobot.utils.prompt_budget import PromptBudget, reduce_messages_to_budget
 
 
 class TestContextBudget:
@@ -235,6 +235,56 @@ class TestContextBudgetManager:
         # Should not double-compact
         assert compacted_once == compacted_twice
 
+    def test_compact_content_handles_mixed_multimodal_blocks_without_payloads(
+        self,
+        budget_manager: ContextBudgetManager,
+    ) -> None:
+        encoded = "A" * 512
+        content = [
+            {"type": "text", "text": "Useful text from the tool."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+            {"type": "input_audio", "input_audio": {"data": encoded, "format": "wav"}},
+            {"type": "future_media", "payload": encoded},
+        ]
+
+        compacted = budget_manager._compact_content(content)
+
+        assert "Useful text from the tool." in compacted
+        assert "[image" in compacted
+        assert "[audio" in compacted
+        assert "future_media" in compacted
+        assert encoded not in compacted
+        assert "base64" not in compacted
+
+    async def test_enforce_budget_handles_mixed_multimodal_tool_results(
+        self,
+        budget_manager: ContextBudgetManager,
+        mock_provider: MagicMock,
+    ) -> None:
+        encoded = "Q" * 512
+        messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "assistant", "content": "Using visual tool", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": [
+                {"type": "text", "text": "Keep this finding."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                {"type": "input_audio", "input_audio": {"data": encoded}},
+            ]},
+            {"role": "assistant", "content": "Using another tool", "tool_calls": [{"id": "2"}]},
+            {"role": "tool", "content": "latest result"},
+        ]
+        mock_provider.estimate_prompt_tokens.side_effect = [
+            (800, "mock"),
+            (100, "mock"),
+        ]
+
+        await budget_manager.enforce_budget(messages, preserve_last_n_turns=1)
+
+        compacted = messages[2]["content"]
+        assert isinstance(compacted, str)
+        assert "Keep this finding." in compacted
+        assert encoded not in compacted
+
 
 class TestContextBuilderIntegration:
     """Integration tests for ContextBuilder with inject_memory flag."""
@@ -394,3 +444,43 @@ class TestAppendHistoryWithSource:
         content = store.history_file.read_text()
         assert "[source=chat]" in content
         assert "[source=cron]" not in content  # Should not add second source
+
+
+def test_prompt_reducer_preserves_current_user_and_atomic_newest_tool_group() -> None:
+    """A large current turn drops old groups without orphaning tool results."""
+
+    class _LengthProvider:
+        @staticmethod
+        def estimate_prompt_tokens(messages, _tools, _model):
+            content_chars = sum(len(str(message.get("content") or "")) for message in messages)
+            return content_chars + len(messages) * 4, "test"
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "current"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "old-call"}],
+        },
+        {"role": "tool", "tool_call_id": "old-call", "content": "x" * 100},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "new-call"}],
+        },
+        {"role": "tool", "tool_call_id": "new-call", "content": "y" * 20},
+    ]
+
+    reduced = reduce_messages_to_budget(
+        messages,
+        _LengthProvider(),
+        "test-model",
+        [],
+        PromptBudget(total_tokens=100, safety_buffer=0),
+    )
+
+    assert reduced[0]["role"] == "system"
+    assert reduced[1] == messages[1]
+    assert not any(message.get("tool_call_id") == "old-call" for message in reduced)
+    assert any(message.get("tool_call_id") == "new-call" for message in reduced)

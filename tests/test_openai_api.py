@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from nanobot.agent.turn import TurnRequest, TurnResult, TurnSource
 from nanobot.api.server import (
     API_CHAT_ID,
     API_SESSION_KEY,
@@ -30,7 +31,11 @@ pytest_plugins = ("pytest_asyncio",)
 
 def _make_mock_agent(response_text: str = "mock response") -> MagicMock:
     agent = MagicMock()
-    agent.process_direct = AsyncMock(return_value=response_text)
+    agent.execute_turn = AsyncMock(return_value=TurnResult(
+        content=response_text,
+        final_content=response_text,
+        run_id="api-run",
+    ))
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
     return agent
@@ -192,12 +197,14 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
     body = await resp.json()
     assert body["choices"][0]["message"]["content"] == "mock response"
     assert body["model"] == "test-model"
-    mock_agent.process_direct.assert_called_once_with(
-        content="hello",
-        session_key=API_SESSION_KEY,
-        channel="api",
-        chat_id=API_CHAT_ID,
-    )
+    mock_agent.execute_turn.assert_called_once()
+    request = mock_agent.execute_turn.await_args.args[0]
+    assert isinstance(request, TurnRequest)
+    assert request.content == "hello"
+    assert request.source is TurnSource.API
+    assert request.session_key == API_SESSION_KEY
+    assert request.route.channel == "api"
+    assert request.route.chat_id == API_CHAT_ID
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -205,12 +212,12 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
 async def test_followup_requests_share_same_session_key(aiohttp_client) -> None:
     call_log: list[str] = []
 
-    async def fake_process(content, session_key="", channel="", chat_id=""):
-        call_log.append(session_key)
-        return f"reply to {content}"
+    async def fake_process(request: TurnRequest):
+        call_log.append(request.session_key or "")
+        return TurnResult(content=f"reply to {request.content}")
 
     agent = MagicMock()
-    agent.process_direct = fake_process
+    agent.execute_turn = fake_process
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
@@ -233,17 +240,18 @@ async def test_followup_requests_share_same_session_key(aiohttp_client) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-async def test_fixed_session_requests_are_serialized(aiohttp_client) -> None:
+async def test_api_does_not_install_a_second_session_lock(aiohttp_client) -> None:
     order: list[str] = []
+    release = asyncio.Event()
 
-    async def slow_process(content, session_key="", channel="", chat_id=""):
-        order.append(f"start:{content}")
-        await asyncio.sleep(0.1)
-        order.append(f"end:{content}")
-        return content
+    async def slow_process(request: TurnRequest):
+        order.append(f"start:{request.content}")
+        await release.wait()
+        order.append(f"end:{request.content}")
+        return TurnResult(content=request.content)
 
     agent = MagicMock()
-    agent.process_direct = slow_process
+    agent.execute_turn = slow_process
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
@@ -256,14 +264,15 @@ async def test_fixed_session_requests_are_serialized(aiohttp_client) -> None:
             json={"messages": [{"role": "user", "content": msg}]},
         )
 
-    r1, r2 = await asyncio.gather(send("first"), send("second"))
+    first = asyncio.create_task(send("first"))
+    second = asyncio.create_task(send("second"))
+    await asyncio.sleep(0.05)
+    assert order.count("start:first") + order.count("start:second") == 2
+    release.set()
+    r1, r2 = await asyncio.gather(first, second)
     assert r1.status == 200
     assert r2.status == 200
-    # Verify serialization: one process must fully finish before the other starts
-    if order[0] == "start:first":
-        assert order.index("end:first") < order.index("start:second")
-    else:
-        assert order.index("end:second") < order.index("start:first")
+    assert "session_locks" not in app
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -307,12 +316,10 @@ async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> N
         },
     )
     assert resp.status == 200
-    mock_agent.process_direct.assert_called_once_with(
-        content="describe this",
-        session_key=API_SESSION_KEY,
-        channel="api",
-        chat_id=API_CHAT_ID,
-    )
+    mock_agent.execute_turn.assert_called_once()
+    request = mock_agent.execute_turn.await_args.args[0]
+    assert request.content == "describe this"
+    assert request.source is TurnSource.API
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -320,15 +327,15 @@ async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> N
 async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     call_count = 0
 
-    async def sometimes_empty(content, session_key="", channel="", chat_id=""):
+    async def sometimes_empty(request: TurnRequest):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return ""
-        return "recovered response"
+            return TurnResult(content="")
+        return TurnResult(content="recovered response")
 
     agent = MagicMock()
-    agent.process_direct = sometimes_empty
+    agent.execute_turn = sometimes_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
@@ -349,13 +356,13 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
 async def test_empty_response_falls_back(aiohttp_client) -> None:
     call_count = 0
 
-    async def always_empty(content, session_key="", channel="", chat_id=""):
+    async def always_empty(request: TurnRequest):
         nonlocal call_count
         call_count += 1
-        return ""
+        return TurnResult(content="")
 
     agent = MagicMock()
-    agent.process_direct = always_empty
+    agent.execute_turn = always_empty
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 

@@ -180,7 +180,7 @@ class WebSearchTool(Tool):
             headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.get(
-                    f"https://s.jina.ai/",
+                    "https://s.jina.ai/",
                     params={"q": query},
                     headers=headers,
                     timeout=15.0,
@@ -234,8 +234,27 @@ class WebFetchTool(Tool):
         self.max_chars = max_chars
         self.proxy = proxy
 
-    async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> Any:
+    async def execute(  # noqa: N803 - external tool schema uses camelCase
+        self,
+        url: str,
+        extractMode: str = "markdown",  # noqa: N803 - external tool schema
+        maxChars: int | None = None,  # noqa: N803 - external tool schema
+        **kwargs: Any,
+    ) -> Any:
         max_chars = maxChars or self.max_chars
+        host = (urlparse(url).hostname or "").lower().strip(".")
+        blocked_hosts = {
+            item.lower().strip().strip(".")
+            for item in os.environ.get("NANOBOT_WEB_FETCH_BLOCKED_HOSTS", "").split(",")
+            if item.strip()
+        }
+        if any(host == blocked or host.endswith(f".{blocked}") for blocked in blocked_hosts):
+            return (
+                "Error: direct web_fetch is disabled for this login-gated platform. "
+                "Use the approved browser route when explicitly allowed, otherwise report the "
+                "source as inaccessible. Search snippets are discovery only, not proof that the "
+                "page was checked."
+            )
         is_valid, error_msg = _validate_url_safe(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})

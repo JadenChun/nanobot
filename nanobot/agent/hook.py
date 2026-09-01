@@ -54,9 +54,10 @@ class AgentHook:
 class CompositeHook(AgentHook):
     """Fan-out hook that delegates to an ordered list of hooks.
 
-    Error isolation: async methods catch and log per-hook exceptions
-    so a faulty custom hook cannot crash the agent loop.
-    ``finalize_content`` is a pipeline (no isolation — bugs should surface).
+    Error isolation: hook exceptions are caught and logged per hook
+    so a faulty custom hook cannot crash the agent loop. ``finalize_content``
+    remains an ordered pipeline, retaining the last successful content when a
+    transform fails.
     """
 
     __slots__ = ("_hooks",)
@@ -65,7 +66,18 @@ class CompositeHook(AgentHook):
         self._hooks = list(hooks)
 
     def wants_streaming(self) -> bool:
-        return any(h.wants_streaming() for h in self._hooks)
+        wants_streaming = False
+        for h in self._hooks:
+            try:
+                if h.wants_streaming():
+                    wants_streaming = True
+            except Exception as exc:
+                logger.error(
+                    "AgentHook.wants_streaming error in {} ({})",
+                    type(h).__name__,
+                    type(exc).__name__,
+                )
+        return wants_streaming
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         for h in self._hooks:
@@ -104,5 +116,14 @@ class CompositeHook(AgentHook):
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         for h in self._hooks:
-            content = h.finalize_content(context, content)
+            try:
+                transformed = h.finalize_content(context, content)
+            except Exception as exc:
+                logger.error(
+                    "AgentHook.finalize_content error in {} ({})",
+                    type(h).__name__,
+                    type(exc).__name__,
+                )
+            else:
+                content = transformed
         return content

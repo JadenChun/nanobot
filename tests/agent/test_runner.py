@@ -33,15 +33,14 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.ForegroundAgentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
 
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -286,6 +285,211 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     assert streamed == ["he", "llo"]
     assert endings == [False]
     provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_policy_block_closes_first_stream_segment() -> None:
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.policy import ToolPolicy, ToolPolicyDecision
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
+        content="I can remove those files.",
+        tool_calls=[ToolCallRequest(id="call_1", name="exec", arguments={"command": "rm -rf x"})],
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    endings: list[bool] = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+            endings.append(resuming)
+
+    class BlockingPolicy(ToolPolicy):
+        async def evaluate(self, *, messages, tool_calls):
+            return ToolPolicyDecision(
+                action="respond",
+                stop_reason="approval_required",
+                response="Approval required before continuing.",
+            )
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        hook=StreamingHook(),
+        tool_policy=BlockingPolicy(),
+    ))
+
+    assert result.stop_reason == "approval_required"
+    assert result.final_content.startswith("Approval required before continuing.")
+    assert endings == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_provider_error_closes_stream_once() -> None:
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_stream_with_retry = AsyncMock(side_effect=RuntimeError("provider down"))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    endings: list[bool] = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+            endings.append(resuming)
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        hook=StreamingHook(),
+    ))
+
+    assert result.stop_reason == "error"
+    assert result.error == "Error: RuntimeError: provider down"
+    assert endings == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_cancellation_closes_stream_once_and_reraises() -> None:
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    started = asyncio.Event()
+
+    async def stream(*, on_content_delta, **kwargs):
+        started.set()
+        await asyncio.Future()
+
+    provider.chat_stream_with_retry = stream
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    endings: list[bool] = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+            endings.append(resuming)
+
+    task = asyncio.create_task(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        hook=StreamingHook(),
+    )))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert endings == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_sequential_batch_at_first_terminal_outcome_and_skips_rest() -> None:
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.tools.base import Tool
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.agent.turn import RunStatus, ToolOutcome
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="working",
+        tool_calls=[
+            ToolCallRequest(id="plan-1", name="plan_task", arguments={}),
+            ToolCallRequest(id="write-1", name="write_file", arguments={}),
+            ToolCallRequest(id="message-1", name="message", arguments={}),
+        ],
+        usage={},
+    ))
+
+    calls: list[str] = []
+
+    class _TerminalTool(Tool):
+        name = "plan_task"
+        description = "terminal test tool"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            calls.append(self.name)
+            return ToolOutcome(
+                content="delegated policy blocked",
+                stop_reason=RunStatus.POLICY_BLOCKED.value,
+                policy_metadata={"requires_approval": False, "source": "nested"},
+            )
+
+    class _SideEffectTool(Tool):
+        def __init__(self, tool_name: str) -> None:
+            self._tool_name = tool_name
+
+        @property
+        def name(self):
+            return self._tool_name
+
+        @property
+        def description(self):
+            return self._tool_name
+
+        @property
+        def parameters(self):
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            calls.append(self.name)
+            return f"{self.name} side effect"
+
+    class _OutcomeRegistry(ToolRegistry):
+        async def execute(self, name, params, context=None, *, execution_context=None):
+            # Preserve ToolOutcome for this contextual-style registry so the
+            # product-neutral runner can observe the shared contract.
+            tool = self.get(name)
+            assert tool is not None
+            return await tool.execute(**params)
+
+    tools = _OutcomeRegistry()
+    tools.register(_TerminalTool())
+    tools.register(_SideEffectTool("write_file"))
+    tools.register(_SideEffectTool("message"))
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "do it"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        concurrent_tools=False,
+    ))
+
+    assert calls == ["plan_task"]
+    assert provider.chat_with_retry.await_count == 1
+    assert result.stop_reason == RunStatus.POLICY_BLOCKED.value
+    assert result.final_content == "delegated policy blocked"
+    assert result.policy_metadata == {"requires_approval": False, "source": "nested"}
+    assert [event["status"] for event in result.tool_events] == [
+        RunStatus.POLICY_BLOCKED.value,
+        "skipped",
+        "skipped",
+    ]
+    tool_results = [message for message in result.messages if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in tool_results] == [
+        "plan-1", "write-1", "message-1",
+    ]
+    assert all("skipped" in str(message["content"]).lower() for message in tool_results[1:])
 
 
 @pytest.mark.asyncio
@@ -581,31 +785,3 @@ async def test_loop_streaming_suppresses_intermediate_tool_preamble(tmp_path):
     # Deltas are now forwarded live for every iteration (not just the final one)
     assert deltas == ["Checking the repo now.", "All set."]
     assert endings == [True, False]
-
-
-@pytest.mark.asyncio
-async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, monkeypatch):
-    from nanobot.agent.subagent import SubagentManager
-    from nanobot.bus.queue import MessageBus
-
-    bus = MessageBus()
-    provider = MagicMock()
-    provider.get_default_model.return_value = "test-model"
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-        content="working",
-        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
-    ))
-    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-    mgr._announce_result = AsyncMock()
-
-    async def fake_execute(self, name, arguments):
-        return "tool result"
-
-    monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
-
-    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, notify=True)
-
-    mgr._announce_result.assert_awaited_once()
-    args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"

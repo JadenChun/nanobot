@@ -179,6 +179,71 @@ async def test_opencode_go_strips_model_prefix() -> None:
 
 
 @pytest.mark.asyncio
+async def test_opencode_deepseek_fills_missing_tool_reasoning_history() -> None:
+    """A missing gateway field must not break the next DeepSeek tool continuation."""
+    mock_create = AsyncMock(return_value=_fake_chat_response())
+    spec = find_by_name("opencode-go")
+    messages = [
+        {"role": "user", "content": "research"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_123", "content": "result"},
+    ]
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create = mock_create
+        provider = OpenAICompatProvider(
+            api_key="opencode-test-key",
+            api_base="https://opencode.ai/zen/go/v1",
+            default_model="deepseek-v4-flash",
+            spec=spec,
+        )
+        await provider.chat(messages=messages, model="deepseek-v4-flash")
+
+    assistant = mock_create.call_args.kwargs["messages"][1]
+    assert assistant["reasoning_content"] == ""
+    assert assistant["content"] == ""
+    assert "reasoning_content" not in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_non_deepseek_does_not_invent_tool_reasoning_history() -> None:
+    mock_create = AsyncMock(return_value=_fake_chat_response())
+    spec = find_by_name("opencode-go")
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create = mock_create
+        provider = OpenAICompatProvider(
+            api_key="opencode-test-key",
+            api_base="https://opencode.ai/zen/go/v1",
+            default_model="kimi-k2.6",
+            spec=spec,
+        )
+        await provider.chat(
+            messages=[{
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            }],
+            model="kimi-k2.6",
+        )
+
+    assistant = mock_create.call_args.kwargs["messages"][0]
+    assert "reasoning_content" not in assistant
+
+
+@pytest.mark.asyncio
 async def test_opencode_go_minimax_returns_clear_error() -> None:
     spec = find_by_name("opencode-go")
 

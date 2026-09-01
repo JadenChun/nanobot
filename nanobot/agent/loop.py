@@ -7,8 +7,10 @@ import json
 import os
 import re
 import time
+import warnings
 from contextlib import AsyncExitStack, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -16,28 +18,33 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
+from nanobot.agent.delegation import (
+    ForegroundAgentManager,
+    reset_current_turn_context,
+    set_current_turn_context,
+)
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.policy import RiskyActionPolicy
+from nanobot.agent.run_store import RunStore
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
 from nanobot.agent.tools.agent_device import AgentDeviceTool
-from nanobot.agent.tools.desktop_use import DesktopUseTool
+from nanobot.agent.tools.crawler import CrawlResearchTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.delegation import DelegateTaskTool, PlanTaskTool, ReviewWorkTool
+from nanobot.agent.tools.desktop_use import DesktopUseTool
 from nanobot.agent.tools.explore import ExploreTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.image import (
     ImageGenerationTool,
     image_generation_available,
 )
-from nanobot.agent.tools.mcp import is_read_only_mcp_tool
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.pipeline import SpawnPipelineTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.social_crawl import crawl_tools_enabled
 from nanobot.agent.tools.trend_vpn import (
     TrendVpnBrowserFetchTool,
     TrendVpnFetchTool,
@@ -46,6 +53,22 @@ from nanobot.agent.tools.trend_vpn import (
     vpn_tools_enabled,
 )
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.turn import (
+    ApprovalGrant,
+    DeliveryState,
+    DeliveryTarget,
+    HistoryMode,
+    RunPolicyContext,
+    RunRecord,
+    RunStatus,
+    SessionRunRef,
+    ToolOutcome,
+    TurnCallbacks,
+    TurnContext,
+    TurnRequest,
+    TurnResult,
+    TurnSource,
+)
 from nanobot.agent.write_guard import FileLockRegistry
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -53,13 +76,14 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.context_repo import ContextRepoManager, ResourceAccessPolicy
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.helpers import build_assistant_message, estimate_prompt_tokens_chain
+from nanobot.utils.prompt_budget import PromptBudgetExceeded
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
         AgentBrowserConfig,
         AgentDeviceConfig,
         ChannelsConfig,
+        CrawlerAgentConfig,
         DesktopUseConfig,
         ExecToolConfig,
         ImageConfig,
@@ -67,6 +91,21 @@ if TYPE_CHECKING:
         WebSearchConfig,
     )
     from nanobot.cron.service import CronService
+
+
+class _TurnStopError(Exception):
+    """Internal signal used to stop the runner before its next model call."""
+
+    def __init__(
+        self,
+        stop_reason: str,
+        content: Any = None,
+        policy_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(stop_reason)
+        self.stop_reason = stop_reason
+        self.content = content
+        self.policy_metadata = policy_metadata or {}
 
 
 class _LoopHook(AgentHook):
@@ -87,6 +126,7 @@ class _LoopHook(AgentHook):
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
     ) -> None:
         self._loop = agent_loop
         self._on_progress = on_progress
@@ -96,10 +136,22 @@ class _LoopHook(AgentHook):
         self._chat_id = chat_id
         self._message_id = message_id
         self._session_key = session_key
+        self._turn_context = turn_context
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
         return self._on_stream is not None
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if self._turn_context is None:
+            return
+        stop_reason = self._turn_context.metadata.get("_tool_stop_reason")
+        if stop_reason:
+            raise _TurnStopError(
+                str(stop_reason),
+                self._turn_context.metadata.get("_tool_stop_content"),
+                dict(self._turn_context.metadata.get("_tool_policy_metadata") or {}),
+            )
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         self._stream_buf += delta
@@ -127,9 +179,21 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id, self._session_key)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        if self._turn_context is not None:
+            self._turn_context.messages = context.messages
+            if context.tool_calls:
+                self._turn_context.tools_used.extend(
+                    tool_call.name for tool_call in context.tool_calls
+                )
+            if context.tool_results:
+                self._turn_context.tool_results.extend(context.tool_results)
+            self._turn_context.metadata["_turn_usage"] = dict(context.usage)
+            self._turn_context.metadata["_turn_tool_events"] = [
+                *self._turn_context.metadata.get("_turn_tool_events", []),
+                *context.tool_events,
+            ]
         for event in context.tool_events:
             if event.get("status") == "error":
                 logger.error(
@@ -183,6 +247,61 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+class _ContextualToolRegistry:
+    """Registry-shaped adapter binding one runner invocation to one turn.
+
+    ``AgentRunner`` intentionally remains product-agnostic and asks its
+    registry for bare model-facing values.  This adapter invokes the WP1
+    contextual registry API, records any terminal policy envelope on the
+    ``TurnContext``, and unwraps only the JSON-safe content sent back to the
+    model.  No per-turn routing state is written to shared tool instances.
+    """
+
+    def __init__(self, registry: ToolRegistry, context: TurnContext) -> None:
+        self._registry = registry
+        self.context = context
+
+    def get_definitions(self) -> list[dict[str, Any]]:
+        return self._registry.get_definitions()
+
+    def get(self, name: str) -> Any:
+        return self._registry.get(name)
+
+    def iter_tools(self):
+        return self._registry.iter_tools()
+
+    @property
+    def tool_names(self) -> list[str]:
+        return self._registry.tool_names
+
+    async def execute(self, name: str, params: dict[str, Any]) -> Any:
+        outcome = await self._registry.execute(name, params, context=self.context)
+        if isinstance(outcome, ToolOutcome):
+            if outcome.stop_reason in {
+                RunStatus.APPROVAL_REQUIRED.value,
+                RunStatus.POLICY_BLOCKED.value,
+                RunStatus.TOOL_ERROR.value,
+                RunStatus.CANCELLED.value,
+            }:
+                self.context.metadata["_tool_stop_reason"] = outcome.stop_reason
+                self.context.metadata["_tool_stop_content"] = outcome.content
+                self.context.metadata["_tool_policy_metadata"] = dict(outcome.policy_metadata)
+            # Preserve the shared envelope for AgentRunner.  It owns the
+            # product-neutral terminal/skip behavior and must see the first
+            # stop before a later outer tool can start.
+            return outcome
+        return ToolOutcome(content=outcome)
+
+    async def execute_with_context(self, name: str, params: dict[str, Any]) -> ToolOutcome:
+        outcome = await self._registry.execute(name, params, context=self.context)
+        return outcome if isinstance(outcome, ToolOutcome) else ToolOutcome(content=outcome)
+
+
+def target_message_id(target: DeliveryTarget | None) -> str | None:
+    """Return a message identifier from a normalized delivery target."""
+    return target.message_id if target is not None else None
+
+
 @dataclass(slots=True)
 class _PendingApproval:
     """Pending risky action awaiting an explicit yes/no reply."""
@@ -192,28 +311,20 @@ class _PendingApproval:
     session_key: str
 
 
-@dataclass(slots=True)
-class _PlanDecision:
-    """Internal planner output."""
+@dataclass(frozen=True, slots=True)
+class _ApprovalSnapshot:
+    """Approval state observed atomically before choosing the detail lock."""
 
-    decision: str = "execute"
-    response: str | None = None
-    action_summary: str = ""
-    review_goal: str = ""
-    references: list[dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def has_handoff(self) -> bool:
-        return bool(self.action_summary or self.review_goal or self.references)
+    alias_key: str
+    pending: _PendingApproval | None
+    action: str
+    effective_key: str
 
 
-@dataclass(slots=True)
-class _VerificationResult:
-    """Structured verifier outcome."""
-
-    verdict: str = "PASS"
-    issues: list[str] = field(default_factory=list)
-    feedback: str = ""
+_STALE_APPROVAL_MESSAGE = (
+    "That approval request is no longer current. "
+    "Please reply to the latest approval request."
+)
 
 
 class AgentLoop:
@@ -232,10 +343,8 @@ class AgentLoop:
     _TOOL_RESULT_CLEARING_SAFETY_BUFFER = 1024
     _TOOL_RESULT_CLEAR_TRIGGER_RATIO = 0.8
     _TOOL_RESULT_CLEAR_TARGET_RATIO = 0.6
-    _DEFAULT_PLANNER_MAX_ITERATIONS = 12
-    _DEFAULT_PLANNER_EXPLORE_MAX_ITERATIONS = 100
-    _DEFAULT_PLANNER_MAX_PARALLEL_EXPLORES = 2
-    _PLANNER_HANDOFF_METADATA_KEY = "planner_handoff"
+    _DEFAULT_EXPLORE_MAX_ITERATIONS = 100
+    _DEFAULT_MAX_PARALLEL_EXPLORES = 2
 
     def __init__(
         self,
@@ -262,17 +371,16 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         context_paths: list[Path] | None = None,
         context_repos: list[Any] | None = None,
-        planning_mode: str = "agent",
-        planner_max_iterations: int = _DEFAULT_PLANNER_MAX_ITERATIONS,
-        planner_explore_subagent_max_iterations: int = _DEFAULT_PLANNER_EXPLORE_MAX_ITERATIONS,
-        planner_max_parallel_explore_agents: int = _DEFAULT_PLANNER_MAX_PARALLEL_EXPLORES,
         tool_result_clearing_keep: int = 3,
         consolidation_trigger_ratio: float = 0.5,
         consolidation_target_ratio: float = 0.3,
+        crawler_agent_config: "CrawlerAgentConfig | None" = None,
+        crawler_provider: LLMProvider | None = None,
     ):
         from nanobot.config.schema import (
             AgentBrowserConfig,
             AgentDeviceConfig,
+            CrawlerAgentConfig,
             DesktopUseConfig,
             ExecToolConfig,
             ImageConfig,
@@ -300,16 +408,12 @@ class AgentLoop:
         self.desktop_use_config = desktop_use_config or DesktopUseConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.image_config = image_config or ImageConfig()
+        self.crawler_agent_config = crawler_agent_config or CrawlerAgentConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
-        self.planning_mode = planning_mode
-        self.planner_max_iterations = max(1, planner_max_iterations)
-        self.planner_explore_subagent_max_iterations = max(1, planner_explore_subagent_max_iterations)
-        self.planner_max_parallel_explore_agents = max(1, planner_max_parallel_explore_agents)
-
         self.context_manager = ContextRepoManager.from_config(
             context_paths=context_paths,
             context_repos=context_repos,
@@ -324,13 +428,13 @@ class AgentLoop:
             workspace,
             timezone=timezone,
             context_manager=self.context_manager,
-            planning_mode=planning_mode,
         )
         self.context_paths = self.context_manager.paths
         self.sessions = session_manager or SessionManager(workspace)
+        self.run_store = RunStore(workspace, session_manager=self.sessions)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
-        
+
         # Unified context budget management
         # Always created when max_tokens.input is set. Handles all context reduction:
         # - Compact old tool results
@@ -354,25 +458,27 @@ class AgentLoop:
                 self.budget_manager.budget.available_budget,
             )
         self._file_lock_registry = FileLockRegistry()
-        self.subagents = SubagentManager(
+        self.delegation = ForegroundAgentManager(
             provider=provider,
             workspace=workspace,
-            bus=bus,
             model=self.model,
             web_search_config=self.web_search_config,
             web_proxy=web_proxy,
             agent_browser_config=self.agent_browser_config,
             agent_device_config=self.agent_device_config,
-            desktop_use_config=self.desktop_use_config,
             exec_config=self.exec_config,
-            image_config=self.image_config,
             context_paths=self.context_paths,
             context_manager=self.context_manager,
             restrict_to_workspace=restrict_to_workspace,
             mcp_servers=mcp_servers or {},
-            planner_max_parallel_explore_agents=self.planner_max_parallel_explore_agents,
+            max_parallel_explore_agents=self._DEFAULT_MAX_PARALLEL_EXPLORES,
+            crawler_provider=crawler_provider,
+            crawler_model=self.crawler_agent_config.model,
+            crawler_max_iterations=self.crawler_agent_config.max_tool_iterations,
+            crawler_max_input_tokens=self.crawler_agent_config.max_tokens.input,
+            crawler_max_output_tokens=self.crawler_agent_config.max_tokens.output,
+            crawler_reasoning_effort=self.crawler_agent_config.reasoning_effort,
             file_lock_registry=self._file_lock_registry,
-            on_completion=self._record_subagent_completion,
         )
 
         self._running = False
@@ -384,6 +490,7 @@ class AgentLoop:
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._pending_approvals: dict[str, _PendingApproval] = {}
+        self._approval_guard = asyncio.Lock()
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -484,44 +591,19 @@ class AgentLoop:
                 humanize_typing=self.desktop_use_config.humanize_typing,
             ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        self.tools.register(SpawnTool(manager=self.subagents))
-        self.tools.register(SpawnPipelineTool(manager=self.subagents))
+        self.tools.register(PlanTaskTool(manager=self.delegation))
+        self.tools.register(DelegateTaskTool(manager=self.delegation))
+        self.tools.register(ReviewWorkTool(manager=self.delegation))
+        self.tools.register(ExploreTool(
+            self.delegation,
+            max_iterations=self._DEFAULT_EXPLORE_MAX_ITERATIONS,
+        ))
+        if self.crawler_agent_config.enabled and crawl_tools_enabled():
+            self.tools.register(CrawlResearchTool(manager=self.delegation))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
-
-    def _build_read_only_tools(self) -> ToolRegistry:
-        """Build a read-only tool registry for planning and verification."""
-        tools = ToolRegistry()
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        extra_read = self._extra_read_dirs(allowed_dir)
-        tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read, resource_policy=self.resource_policy))
-        tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read, resource_policy=self.resource_policy))
-        if self.exec_config.enable:
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-                resource_policy=self.resource_policy,
-                desktop_use_active=self.desktop_use_config.enabled,
-            ))
-        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-        tools.register(WebFetchTool(proxy=self.web_proxy))
-        for tool in self.tools.iter_tools():
-            if is_read_only_mcp_tool(tool):
-                tools.register(tool)
-        return tools
-
-    def _build_planner_tools(self) -> ToolRegistry:
-        """Build planner tools, including foreground explore delegation."""
-        tools = self._build_read_only_tools()
-        tools.register(ExploreTool(
-            self.subagents,
-            max_iterations=self.planner_explore_subagent_max_iterations,
-        ))
-        return tools
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -558,14 +640,6 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.set_context(channel, chat_id, message_id)
 
-        if spawn_tool := self.tools.get("spawn"):
-            if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id, effective_session_key)
-
-        if pipeline_tool := self.tools.get("spawn_pipeline"):
-            if isinstance(pipeline_tool, SpawnPipelineTool):
-                pipeline_tool.set_context(channel, chat_id, effective_session_key)
-
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
@@ -593,266 +667,11 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
-    @staticmethod
-    def _find_legal_message_start(messages: list[dict[str, Any]]) -> int:
-        """Find the first index where tool results have matching assistant tool_calls."""
-        declared: set[str] = set()
-        start = 0
-        for index, message in enumerate(messages):
-            role = message.get("role")
-            if role == "assistant":
-                for tool_call in message.get("tool_calls") or []:
-                    if isinstance(tool_call, dict) and tool_call.get("id"):
-                        declared.add(str(tool_call["id"]))
-            elif role == "tool":
-                tool_call_id = message.get("tool_call_id")
-                if tool_call_id and str(tool_call_id) not in declared:
-                    start = index + 1
-                    declared.clear()
-                    for previous in messages[start:index + 1]:
-                        if previous.get("role") == "assistant":
-                            for tool_call in previous.get("tool_calls") or []:
-                                if isinstance(tool_call, dict) and tool_call.get("id"):
-                                    declared.add(str(tool_call["id"]))
-        return start
-
-    @classmethod
-    def _recent_legal_messages(
-        cls,
-        messages: list[dict[str, Any]],
-        *,
-        max_messages: int,
-    ) -> list[dict[str, Any]]:
-        """Return a recent suffix that does not start with orphaned tool results."""
-        sliced = messages[-max_messages:] if max_messages > 0 else list(messages)
-        start = cls._find_legal_message_start(sliced)
-        return sliced[start:] if start else sliced
-
-    @staticmethod
-    def _flatten_unknown_tool_exchanges(
-        messages: list[dict[str, Any]],
-        known_tool_names: set[str],
-    ) -> list[dict[str, Any]]:
-        """Rewrite assistant/tool exchanges referencing unknown tools into plain text.
-
-        When the verifier (or any read-only secondary pass) replays a session
-        history that called tools not present in *its* tool registry, strict
-        providers (notably the GitHub Copilot OpenAI-compatible proxy) reject
-        the request with HTTP 400 because the history references tool names
-        the model wasn't told about.
-
-        This collapses any assistant message whose ``tool_calls`` reference at
-        least one unknown tool into a plain assistant text message, and
-        rewrites the matching ``tool`` result messages into ``user`` text
-        notes with the same content. Known-tool exchanges are left intact so
-        the verifier can still reason about them naturally.
-        """
-        if not messages:
-            return messages
-
-        # Pass 1: figure out which tool_call_ids belong to "unknown" assistant calls.
-        unknown_tool_call_ids: set[str] = set()
-        rewritten_assistant: dict[int, dict[str, Any]] = {}
-        for idx, msg in enumerate(messages):
-            if msg.get("role") != "assistant":
-                continue
-            tool_calls = msg.get("tool_calls") or []
-            if not tool_calls:
-                continue
-            has_unknown = False
-            names: list[str] = []
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                name = (tc.get("function") or {}).get("name") or tc.get("name") or "?"
-                names.append(str(name))
-                if name not in known_tool_names:
-                    has_unknown = True
-                    if tc.get("id"):
-                        unknown_tool_call_ids.add(str(tc["id"]))
-            if not has_unknown:
-                continue
-            # Build a narrative replacement for this assistant turn.
-            original_content = msg.get("content")
-            if isinstance(original_content, list):
-                text_parts = [
-                    b.get("text", "")
-                    for b in original_content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ]
-                base_text = "\n".join(t for t in text_parts if t).strip()
-            else:
-                base_text = (original_content or "").strip() if isinstance(original_content, str) else ""
-            summary = f"[Prior tool calls: {', '.join(names)}]"
-            new_text = f"{base_text}\n\n{summary}".strip() if base_text else summary
-            rewritten_assistant[idx] = {"role": "assistant", "content": new_text}
-
-        if not rewritten_assistant and not unknown_tool_call_ids:
-            return messages
-
-        # Pass 2: emit rewritten history.
-        result: list[dict[str, Any]] = []
-        for idx, msg in enumerate(messages):
-            if idx in rewritten_assistant:
-                result.append(rewritten_assistant[idx])
-                continue
-            if msg.get("role") == "tool":
-                tcid = msg.get("tool_call_id")
-                if tcid and str(tcid) in unknown_tool_call_ids:
-                    # Convert orphaned tool result into a plain user note so
-                    # the verifier still sees the output without referencing
-                    # an unknown tool schema. Preserve image_url blocks so the
-                    # verifier can still see screenshots (image pruner upstream
-                    # trims older ones).
-                    raw_content = msg.get("content")
-                    name = msg.get("name") or "tool"
-                    new_blocks: list[Any] = []
-                    if isinstance(raw_content, list):
-                        text_parts: list[str] = []
-                        image_blocks: list[dict[str, Any]] = []
-                        for b in raw_content:
-                            if not isinstance(b, dict):
-                                continue
-                            if b.get("type") == "text":
-                                text_parts.append(b.get("text") or "")
-                            elif b.get("type") == "image_url":
-                                image_blocks.append(b)
-                        text = "\n".join(t for t in text_parts if t).strip() or "(empty tool result)"
-                        new_blocks.append({"type": "text", "text": f"[Result of prior {name} call]\n{text}"})
-                        new_blocks.extend(image_blocks)
-                    elif isinstance(raw_content, str):
-                        new_blocks = [{"type": "text", "text": f"[Result of prior {name} call]\n{raw_content}"}]
-                    else:
-                        new_blocks = [{"type": "text", "text": f"[Result of prior {name} call]\n(empty tool result)"}]
-
-                    if len(new_blocks) == 1 and new_blocks[0].get("type") == "text":
-                        result.append({"role": "user", "content": new_blocks[0]["text"]})
-                    else:
-                        result.append({"role": "user", "content": new_blocks})
-                    continue
-            result.append(msg)
-        return result
-
-    @staticmethod
-    def _summarize_history_for_verifier(
-        messages: list[dict[str, Any]],
-        *,
-        max_image_blocks: int = 1,
-        max_text_chars: int = 6000,
-    ) -> list[dict[str, Any]]:
-        """Collapse an action conversation into a single narrative user message.
-
-        The verifier runs against strict providers (e.g. GitHub Copilot's
-        OpenAI-compat proxy) that reject conversation histories whose
-        ``tool_calls`` reference tool names not registered in the current
-        request. Even when we try to flatten unknown-tool exchanges, the
-        replayed history is large enough — and shaped specifically enough —
-        that some proxies still return HTTP 400.
-
-        To sidestep all of that, build a single ``user`` message that:
-
-        * narrates each assistant text turn,
-        * lists the tool calls that happened with a short args preview,
-        * inlines short tool-result text,
-        * keeps at most ``max_image_blocks`` of the most recent screenshots
-          attached as ``image_url`` blocks (so vision-capable verifiers can
-          still inspect the final state).
-
-        Returns a list with zero or one message ready to splice after the
-        verifier's system/user instructions.
-        """
-        if not messages:
-            return []
-
-        narrative_lines: list[str] = ["[Action-phase transcript follows]"]
-        # Walk from oldest to newest, collecting text. Collect image blocks
-        # separately and we'll keep the last N at the end.
-        image_blocks: list[dict[str, Any]] = []
-
-        def _truncate(text: str, limit: int = 500) -> str:
-            text = (text or "").strip()
-            if len(text) <= limit:
-                return text
-            return text[:limit] + "…"
-
-        def _arg_preview(args: Any) -> str:
-            if isinstance(args, str):
-                return _truncate(args, 120)
-            try:
-                import json as _json
-                return _truncate(_json.dumps(args, ensure_ascii=False), 120)
-            except Exception:
-                return _truncate(str(args), 120)
-
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-            if role == "system":
-                # Skip system messages; the verifier has its own.
-                continue
-            if role == "user":
-                if isinstance(content, str) and content.strip():
-                    narrative_lines.append(f"USER: {_truncate(content, 1500)}")
-                elif isinstance(content, list):
-                    for b in content:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "text" and b.get("text"):
-                            narrative_lines.append(f"USER: {_truncate(b['text'], 1500)}")
-                        elif b.get("type") == "image_url":
-                            image_blocks.append(b)
-            elif role == "assistant":
-                text_part = ""
-                if isinstance(content, str):
-                    text_part = content
-                elif isinstance(content, list):
-                    text_part = "\n".join(
-                        b.get("text", "")
-                        for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                text_part = text_part.strip()
-                if text_part:
-                    narrative_lines.append(f"ASSISTANT: {_truncate(text_part, 1500)}")
-                tool_calls = msg.get("tool_calls") or []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    name = (tc.get("function") or {}).get("name") or tc.get("name") or "?"
-                    raw_args = (tc.get("function") or {}).get("arguments") or tc.get("arguments")
-                    narrative_lines.append(f"  → tool_call {name}({_arg_preview(raw_args)})")
-            elif role == "tool":
-                name = msg.get("name") or "tool"
-                if isinstance(content, str):
-                    narrative_lines.append(f"  ← {name} result: {_truncate(content, 600)}")
-                elif isinstance(content, list):
-                    text_parts: list[str] = []
-                    for b in content:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "text" and b.get("text"):
-                            text_parts.append(b["text"])
-                        elif b.get("type") == "image_url":
-                            image_blocks.append(b)
-                    joined = "\n".join(text_parts).strip()
-                    if joined:
-                        narrative_lines.append(f"  ← {name} result: {_truncate(joined, 600)}")
-                    else:
-                        narrative_lines.append(f"  ← {name} result: [non-text content]")
-
-        narrative = "\n".join(narrative_lines)
-        if len(narrative) > max_text_chars:
-            # Keep the tail (most recent activity is most relevant for verification).
-            narrative = "[…truncated earlier history…]\n" + narrative[-max_text_chars:]
-
-        # Keep only the most recent N image blocks.
-        tail_images = image_blocks[-max_image_blocks:] if max_image_blocks > 0 else []
-        if tail_images:
-            blocks: list[dict[str, Any]] = [{"type": "text", "text": narrative}]
-            blocks.extend(tail_images)
-            return [{"role": "user", "content": blocks}]
-        return [{"role": "user", "content": narrative}]
-
+    def _channel_task_update_mode(self, channel: str) -> str:
+        """Return the configured delivery mode for chat-channel task updates."""
+        if channel == "cli" or self.channels_config is None:
+            return "verbose"
+        return self.channels_config.task_update_mode
 
     @staticmethod
     def _is_affirmative(text: str) -> bool:
@@ -862,28 +681,75 @@ class AgentLoop:
     def _is_negative(text: str) -> bool:
         return bool(re.fullmatch(r"\s*(no|n|cancel|stop|don't|do not)\s*[.!]?\s*", text, re.I))
 
-    def _clear_pending_approval(
+    async def _snapshot_approval(self, key: str, content: str) -> _ApprovalSnapshot:
+        """Snapshot and classify a pending approval without holding session locks."""
+        async with self._approval_guard:
+            pending = self._pending_approvals.get(key)
+            if pending is None:
+                return _ApprovalSnapshot(
+                    alias_key=key,
+                    pending=None,
+                    action="none",
+                    effective_key=key,
+                )
+
+            raw = content.strip()
+            if self._is_affirmative(raw):
+                action = "affirmative"
+                effective_key = pending.session_key
+            elif self._is_negative(raw):
+                action = "negative"
+                effective_key = key
+            elif raw.startswith("/"):
+                # Slash commands are routed independently and must not consume
+                # an approval merely because one is pending in this chat.
+                action = "command"
+                effective_key = key
+            else:
+                action = "other"
+                effective_key = key
+
+            return _ApprovalSnapshot(
+                alias_key=key,
+                pending=pending,
+                action=action,
+                effective_key=effective_key,
+            )
+
+    def _remove_pending_approval_identity_locked(self, pending: _PendingApproval) -> bool:
+        """Remove only aliases whose value is exactly ``pending``.
+
+        Callers must already hold ``_approval_guard``.  Comparing object
+        identity is deliberate: a newer approval may reuse the same detail
+        session key while replacing the visible-chat alias.
+        """
+        removed = False
+        for approval_key, approval in list(self._pending_approvals.items()):
+            if approval is pending:
+                self._pending_approvals.pop(approval_key, None)
+                removed = True
+        return removed
+
+    async def _clear_pending_approval(
         self,
         key: str,
         pending: _PendingApproval | None = None,
-    ) -> None:
-        """Clear a pending approval and any chat alias pointing at it."""
-        pending = pending or self._pending_approvals.get(key)
-        if pending is None:
-            self._pending_approvals.pop(key, None)
-            return
-        for approval_key, approval in list(self._pending_approvals.items()):
-            if approval is pending or approval.session_key == pending.session_key:
-                self._pending_approvals.pop(approval_key, None)
+    ) -> bool:
+        """Clear the current approval alias and all aliases of that object."""
+        async with self._approval_guard:
+            candidate = pending or self._pending_approvals.get(key)
+            if candidate is None or self._pending_approvals.get(key) is not candidate:
+                return False
+            return self._remove_pending_approval_identity_locked(candidate)
 
-    def _store_pending_approval(
+    def _store_pending_approval_locked(
         self,
         *,
         session_key: str,
         channel: str,
         chat_id: str,
         summary: str,
-    ) -> None:
+    ) -> _PendingApproval:
         """Store approval by task session and by the user-visible chat."""
         pending = _PendingApproval(
             summary=summary,
@@ -894,6 +760,24 @@ class AgentLoop:
         visible_key = f"{channel}:{chat_id}"
         if visible_key != session_key:
             self._pending_approvals[visible_key] = pending
+        return pending
+
+    async def _store_pending_approval(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        summary: str,
+    ) -> _PendingApproval:
+        """Store an approval under the short-lived approval-map guard."""
+        async with self._approval_guard:
+            return self._store_pending_approval_locked(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                summary=summary,
+            )
 
     @staticmethod
     def _should_mirror_task_session(session_key: str, visible_key: str) -> bool:
@@ -911,26 +795,35 @@ class AgentLoop:
         task_text: str,
         response_text: str,
         approval_granted: bool,
+        run_id: str | None = None,
+        status: str = "completed",
+        stop_reason: str | None = None,
+        occurrence_id: str | None = None,
     ) -> None:
-        """Mirror scheduled-task context into the chat users continue from."""
+        """Record bounded scheduled-task metadata for the chat users continue from."""
         visible_key = f"{channel}:{chat_id}"
         if not self._should_mirror_task_session(session_key, visible_key):
             return
 
+        # Scheduled execution has its complete trace in the detail session.
+        # Keep the visible chat's model-facing history bounded by storing only
+        # a compact run reference and excerpts in the metadata ring.  The
+        # compatibility ``get_history`` view can still synthesize the old
+        # instruction/result pair for trace readers without persisting another
+        # full turn in the visible JSONL.
         visible_session = self.sessions.get_or_create(visible_key)
-        label = "Scheduled task approval" if approval_granted else "Scheduled task"
-        task_snippet = task_text.strip()
-        if len(task_snippet) > 4000:
-            task_snippet = task_snippet[:4000].rstrip() + "\n... (truncated)"
-
-        visible_session.add_message(
-            "user",
-            (
-                f"[{label} from {session_key}]\n"
-                f"{task_snippet}"
-            ),
+        detail_id = session_key.split(":", 1)[1] if ":" in session_key else session_key
+        visible_session.add_scheduled_run(
+            job_id=detail_id,
+            run_id=run_id or f"legacy:{detail_id}",
+            instruction=task_text,
+            result=response_text,
+            detail_session_key=session_key,
+            status=status,
+            approval_granted=approval_granted,
+            stop_reason=stop_reason,
+            occurrence_id=occurrence_id,
         )
-        visible_session.add_message("assistant", response_text)
         self.sessions.save(visible_session)
 
     @staticmethod
@@ -939,46 +832,6 @@ class AgentLoop:
         if len(text) <= max_chars:
             return text
         return text[:max_chars].rstrip() + "\n... (truncated)"
-
-    def _subagent_completion_record(self, event: dict[str, Any]) -> str:
-        status = "completed" if event.get("status") == "ok" else "failed"
-        notify = "yes" if event.get("notify") else "no"
-        lines = [
-            f"[Background subagent {status}]",
-            f"Label: {event.get('label') or 'subagent'}",
-            f"Task id: {event.get('task_id') or 'unknown'}",
-            f"Notify user: {notify}",
-            "",
-            "Task:",
-            self._truncate_ledger_text(str(event.get("task") or "")),
-            "",
-            "Result:",
-            self._truncate_ledger_text(str(event.get("result") or "")),
-        ]
-        review_meta = event.get("review_meta")
-        if isinstance(review_meta, dict):
-            approved = "yes" if review_meta.get("approved") else "no"
-            confidence = review_meta.get("confidence", "?")
-            lines.extend(["", f"Review approved: {approved}", f"Review confidence: {confidence}%"])
-            issues = review_meta.get("issues")
-            if isinstance(issues, list) and issues:
-                lines.append(f"Review issues: {'; '.join(str(issue) for issue in issues)}")
-        return "\n".join(lines)
-
-    async def _record_subagent_completion(self, event: dict[str, Any]) -> None:
-        """Persist subagent outcome for the main agent's orchestration context."""
-        origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
-        channel = str(origin.get("channel") or "cli")
-        chat_id = str(origin.get("chat_id") or "direct")
-        session_key = str(event.get("session_key") or f"{channel}:{chat_id}")
-        record = self._subagent_completion_record(event)
-
-        self._record_session_ledger(
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
-            record=record,
-        )
 
     def _record_session_ledger(
         self,
@@ -1006,14 +859,10 @@ class AgentLoop:
         channel: str,
         chat_id: str,
         active_tasks: int,
-        subagent_tasks: int,
     ) -> None:
-        total = active_tasks + subagent_tasks
         record = "\n".join([
-            "[Background task cancelled]",
-            f"Stopped tasks: {total}",
-            f"Active main-agent tasks: {active_tasks}",
-            f"Background subagent tasks: {subagent_tasks}",
+            "[Task cancelled]",
+            f"Stopped tasks: {active_tasks}",
         ])
         self._record_session_ledger(
             session_key=session_key,
@@ -1049,38 +898,6 @@ class AgentLoop:
             record=record,
         )
 
-    @staticmethod
-    def _is_simple_conversation(text: str) -> bool:
-        cleaned = text.strip().lower()
-        if not cleaned:
-            return True
-        if len(cleaned) > 120:
-            return False
-        if re.search(r"\b(fix|update|implement|change|edit|write|create|add|remove|delete|refactor|debug|test|run|search|check|plan)\b", cleaned):
-            return False
-        return cleaned.endswith("?")
-
-    def _should_plan(self, text: str) -> bool:
-        return self._should_plan_with_mode(text, self.planning_mode)
-
-    def _should_plan_with_mode(self, text: str, mode: str) -> bool:
-        if mode == "off":
-            return False
-        if self._is_simple_conversation(text):
-            return False
-        if mode == "on":
-            return True
-        return bool(re.search(
-            r"\b(fix|update|implement|change|edit|write|create|add|remove|delete|refactor|debug|test|run|search|check|review|plan)\b",
-            text,
-            re.I,
-        ) or len(text.strip()) > 160)
-
-    def _should_verify(self, text: str, tools_used: list[str], planned: _PlanDecision | None) -> bool:
-        if self.planning_mode == "on" and not self._is_simple_conversation(text):
-            return True
-        return any(name in {"write_file", "edit_file", "exec", "spawn", "spawn_pipeline", "desktop_use"} for name in tools_used)
-
     def _tool_result_clear_thresholds(self) -> tuple[int | None, int | None]:
         """Return prompt-token thresholds for compacting stale tool results."""
         if self.max_tokens.input <= 0:
@@ -1098,366 +915,6 @@ class AgentLoop:
         target = int(budget * self._TOOL_RESULT_CLEAR_TARGET_RATIO)
         return trigger or None, target or None
 
-    def _channel_task_update_mode(self, channel: str) -> str:
-        """Return the task update mode for chat channels.
-
-        CLI intentionally keeps its current progress behavior regardless of
-        channel reply mode settings.
-        """
-        if channel == "cli" or self.channels_config is None:
-            return "verbose"
-        return self.channels_config.task_update_mode
-
-    @staticmethod
-    def _planner_user_message(planned: _PlanDecision) -> str | None:
-        """Build the short user-facing plan summary for plan_result mode."""
-        summary = planned.action_summary.strip()
-        if not summary:
-            return None
-        return f"Plan: {summary}"
-
-    def _planner_prompt(self) -> str:
-        planner_tool_names = sorted(self._build_planner_tools().tool_names)
-        executor_only = sorted(set(self.tools.tool_names) - set(planner_tool_names))
-        executor_hint = (
-            ", ".join(executor_only) if executor_only else "(none — planner has direct access to all tools)"
-        )
-        return f"""# Internal Planner
-
-You are nanobot's internal planner. Stay focused on coordination: gather enough evidence, draft the execution handoff, and sanity-check it before action begins. Do not modify files or external systems.
-
-## Workspace
-{self.workspace}
-
-## Action-phase capabilities
-You do NOT call these directly, but the action phase WILL have them in addition to your read-only tools. Choose `execute` whenever the user's request needs any of them — never refuse a request just because you cannot call the tool yourself:
-{executor_hint}
-
-## Workflow
-Follow this internal loop until the handoff is ready or you run out of planner iterations:
-
-1. Explore
-- Use direct read-only tools for narrow targeted checks.
-- Use the `explore` tool for broad or repeated investigation that would otherwise bloat your context.
-- At most {self.planner_max_parallel_explore_agents} `explore` calls may run in parallel in one response. Use fewer when one is enough.
-- Keep gathering evidence when key facts are still missing.
-
-2. Plan
-- Draft the concrete work the action phase should do.
-- Draft a specific review goal that the verification phase can check.
-- Build a references list with evidence-backed findings. Include the ACTUAL VALUES you gathered (file contents, command outputs) so the action phase can use them directly without re-reading.
-
-3. Review
-- Ask yourself whether the current handoff is ready for action and review without repeating the same research.
-- If evidence is missing, go back to Explore.
-- If evidence is enough but the plan is weak or vague, refine the handoff.
-- Stop once action and review can proceed directly from your handoff.
-
-## Decision Rules
-- Use `answer` when no mutating or multi-step work is needed.
-- Use `clarify` only when multiple plausible interpretations would change execution and inspection cannot resolve them.
-- Use `execute` only when your inspected evidence is sufficient for action and review to proceed.
-- Do not guess when the task depends on evidence you have not checked.
-
-## Output
-End your response with exactly:
-
----PLAN---
-{{"decision":"answer_or_clarify_or_execute","response":"user-facing text when decision is answer/clarify","action_summary":"short concrete execution summary","review_goal":"what the review phase should verify","references":[{{"finding":"concise description of what was found","value":"the actual value gathered (file content, command output, etc.)","source":"tool_name: arguments or description of how this was gathered","references":["file: /abs/path/example.py","function: helper_name"],"open_question":"optional unresolved gap"}}]}}
----END---
-
-For `execute`, `action_summary`, `review_goal`, and `references` are required.
-IMPORTANT: Include `value` in each reference so the action phase can use the gathered data directly without re-reading files or re-running commands.
-Keep every finding concise, concrete, and tied to exact references."""
-
-    @staticmethod
-    def _parse_plan_decision(result: str | None) -> _PlanDecision:
-        if not result:
-            return _PlanDecision()
-        match = re.search(r"---PLAN---\s*\n(.*?)\n\s*---END---", result, re.DOTALL)
-        if not match:
-            return _PlanDecision()
-        try:
-            payload = json.loads(match.group(1).strip())
-        except Exception:
-            return _PlanDecision()
-        decision = str(payload.get("decision") or "execute").strip().lower()
-        if decision not in {"answer", "clarify", "execute"}:
-            decision = "execute"
-        references = AgentLoop._normalize_plan_references(payload.get("references"))
-        return _PlanDecision(
-            decision=decision,
-            response=str(payload.get("response") or "").strip() or None,
-            action_summary=str(payload.get("action_summary") or payload.get("summary") or "").strip(),
-            review_goal=str(payload.get("review_goal") or "").strip(),
-            references=references,
-        )
-
-    @staticmethod
-    def _normalize_plan_references(payload: Any) -> list[dict[str, Any]]:
-        """Normalize planner references into a stable list of finding entries."""
-        if not isinstance(payload, list):
-            return []
-
-        normalized: list[dict[str, Any]] = []
-        for item in payload:
-            if isinstance(item, str):
-                finding = item.strip()
-                if finding:
-                    normalized.append({"finding": finding, "references": []})
-                continue
-            if not isinstance(item, dict):
-                continue
-            finding = str(item.get("finding") or "").strip()
-            value = item.get("value")
-            source = str(item.get("source") or "").strip() or None
-            refs_raw = item.get("references") or []
-            references = (
-                [str(ref).strip() for ref in refs_raw if str(ref).strip()]
-                if isinstance(refs_raw, list)
-                else ([str(refs_raw).strip()] if str(refs_raw).strip() else [])
-            )
-            open_question = str(item.get("open_question") or "").strip() or None
-            if not finding and not references and not open_question and value is None:
-                continue
-            entry: dict[str, Any] = {
-                "finding": finding,
-                "references": references,
-            }
-            if value is not None:
-                entry["value"] = value
-            if source:
-                entry["source"] = source
-            if open_question:
-                entry["open_question"] = open_question
-            normalized.append(entry)
-        return normalized
-
-    @staticmethod
-    def _planner_handoff_message(planned: _PlanDecision) -> str:
-        """Build the planner handoff injected into action/review phases."""
-        parts = [
-            "Internal planner handoff. The following data was gathered with read-only investigation tools.",
-            "IMPORTANT: TRUST these values as ground truth. Use them directly without re-reading files or re-running commands. "
-            "Only gather new information if the task requires data NOT listed in the references below."
-        ]
-        if planned.action_summary:
-            parts.append(f"Action Summary:\n{planned.action_summary}")
-        if planned.review_goal:
-            parts.append(f"Review Goal:\n{planned.review_goal}")
-        if planned.references:
-            rendered: list[str] = []
-            for idx, item in enumerate(planned.references, start=1):
-                finding = item.get('finding') or '(unspecified)'
-                value = item.get('value')
-                source = item.get('source')
-                entry = [f"{idx}. {finding}"]
-                if value is not None:
-                    entry.append(f"   Value: {value}")
-                if source:
-                    entry.append(f"   Source: {source}")
-                refs = item.get("references") or []
-                if refs:
-                    entry.append("   References:")
-                    entry.extend(f"   - {ref}" for ref in refs)
-                if item.get("open_question"):
-                    entry.append(f"   Open Question: {item['open_question']}")
-                rendered.append("\n".join(entry))
-            parts.append("Gathered Context:\n" + "\n".join(rendered))
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _planner_verification_goal(task_text: str, planned: _PlanDecision | None) -> str:
-        """Build the concrete review goal from the planner handoff."""
-        if planned is None:
-            return task_text
-
-        parts: list[str] = []
-        if planned.review_goal:
-            parts.append(planned.review_goal)
-        elif planned.action_summary:
-            parts.append(planned.action_summary)
-        else:
-            parts.append(task_text)
-
-        if planned.references:
-            lines: list[str] = []
-            for idx, item in enumerate(planned.references, start=1):
-                finding = str(item.get("finding") or "").strip()
-                value = item.get("value")
-                source = item.get("source")
-                refs = item.get("references") or []
-                if finding:
-                    lines.append(f"{idx}. {finding}")
-                if value is not None:
-                    lines.append(f"   - Value: {value}")
-                if source:
-                    lines.append(f"   - Source: {source}")
-                for ref in refs:
-                    lines.append(f"   - {ref}")
-                if item.get("open_question"):
-                    lines.append(f"   - Open question: {item['open_question']}")
-            if lines:
-                parts.append("Planner References:\n" + "\n".join(lines))
-
-        return "\n\n".join(part for part in parts if part.strip())
-
-    @staticmethod
-    def _log_preview(text: str | None, limit: int = 120) -> str:
-        """Render a short single-line preview for lifecycle logs."""
-        if not text:
-            return ""
-        collapsed = re.sub(r"\s+", " ", text.strip())
-        if len(collapsed) <= limit:
-            return collapsed
-        return collapsed[:limit] + "..."
-
-    @classmethod
-    def _serialize_planner_handoff(cls, task_text: str, planned: _PlanDecision) -> dict[str, Any]:
-        """Persist a planner handoff in session metadata while the task is active."""
-        return {
-            "task_text": task_text,
-            "decision": planned.decision,
-            "response": planned.response,
-            "action_summary": planned.action_summary,
-            "review_goal": planned.review_goal,
-            "references": planned.references,
-        }
-
-    @classmethod
-    def _store_planner_handoff(cls, session: Session, task_text: str, planned: _PlanDecision) -> None:
-        session.metadata[cls._PLANNER_HANDOFF_METADATA_KEY] = cls._serialize_planner_handoff(task_text, planned)
-
-    @classmethod
-    def _clear_planner_handoff(cls, session: Session) -> None:
-        session.metadata.pop(cls._PLANNER_HANDOFF_METADATA_KEY, None)
-
-    def _verifier_prompt(self, goal: str) -> str:
-        return f"""# Internal Verifier
-
-You are nanobot's internal verification pass.
-
-## Goal
-{goal}
-
-## Rules
-- You MUST NOT modify files, repositories, or external systems.
-- Verify claims with concrete files, commands, or artifacts when possible.
-- For video, timeline, or media-editing tasks, you MUST inspect the actual timeline/previews with read-only MCP tools when they are available.
-- If a media-editing claim would require timeline/preview inspection and you cannot inspect it, do not return PASS.
-- If work is incomplete or risky, say so directly.
-
-## Output
-End your response with exactly:
-
----VERIFY---
-{{"verdict":"PASS_or_FAIL_or_PARTIAL","issues":["issue1"],"feedback":"brief actionable feedback"}}
----END---"""
-
-    @staticmethod
-    def _parse_verification_result(result: str | None) -> _VerificationResult:
-        if not result:
-            return _VerificationResult(verdict="PARTIAL", issues=["Verifier produced no output"], feedback="Verifier produced no output.")
-        match = re.search(r"---VERIFY---\s*\n(.*?)\n\s*---END---", result, re.DOTALL)
-        if not match:
-            return _VerificationResult(verdict="PARTIAL", issues=["Verifier response was not structured"], feedback=result[-500:])
-        try:
-            payload = json.loads(match.group(1).strip())
-        except Exception:
-            return _VerificationResult(verdict="PARTIAL", issues=["Failed to parse verifier output"], feedback=result[-500:])
-        verdict = str(payload.get("verdict") or "PARTIAL").strip().upper()
-        if verdict not in {"PASS", "FAIL", "PARTIAL"}:
-            verdict = "PARTIAL"
-        issues = payload.get("issues") or []
-        if not isinstance(issues, list):
-            issues = [str(issues)]
-        return _VerificationResult(
-            verdict=verdict,
-            issues=[str(issue) for issue in issues],
-            feedback=str(payload.get("feedback") or "").strip(),
-        )
-
-    async def _run_internal_planner(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        channel: str,
-        chat_id: str,
-    ) -> _PlanDecision:
-        logger.info(
-            "Planner phase started for {}:{} (max_iterations={})",
-            channel,
-            chat_id,
-            self.planner_max_iterations,
-        )
-        planner_messages = [{"role": "system", "content": self._planner_prompt()}, *messages]
-        result = await self._run_agent(
-            planner_messages,
-            tools=self._build_planner_tools(),
-            max_iterations=self.planner_max_iterations,
-            preserve_tool_results=True,
-            channel=channel,
-            chat_id=chat_id,
-        )
-        planned = self._parse_plan_decision(result.final_content)
-        logger.info(
-            "Planner phase completed for {}:{} with decision={} handoff={} stop_reason={}",
-            channel,
-            chat_id,
-            planned.decision or "unknown",
-            planned.has_handoff,
-            result.stop_reason or "completed",
-        )
-        return planned
-
-    async def _run_internal_verifier(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        goal: str,
-        channel: str,
-        chat_id: str,
-    ) -> _VerificationResult:
-        logger.info(
-            "Verification phase started for {}:{} goal={}",
-            channel,
-            chat_id,
-            self._log_preview(goal, limit=140),
-        )
-        recent_messages = self._recent_legal_messages(messages, max_messages=12)
-        verifier_tools = self._build_read_only_tools()
-        # Strict providers (e.g. GitHub Copilot's OpenAI-compat proxy) return
-        # HTTP 400 when conversation history references tool names or tool_call
-        # ids the model wasn't told about. Collapse the prior action transcript
-        # into a single narrative user message so the verifier sees a clean,
-        # schema-safe context with at most one recent screenshot attached.
-        summarized = self._summarize_history_for_verifier(recent_messages)
-        verify_messages = [
-            {"role": "system", "content": self._verifier_prompt(goal)},
-            {"role": "user", "content": (
-                "Review the completed work against the goal below.\n\n"
-                f"Goal:\n{goal}\n\n"
-                "Read any changed files or artifacts and verify the result."
-            )},
-            *summarized,
-        ]
-        result = await self._run_agent(
-            verify_messages,
-            tools=verifier_tools,
-            max_iterations=10,
-            channel=channel,
-            chat_id=chat_id,
-        )
-        verification = self._parse_verification_result(result.final_content)
-        logger.info(
-            "Verification phase completed for {}:{} verdict={} issues={}",
-            channel,
-            chat_id,
-            verification.verdict,
-            len(verification.issues),
-        )
-        return verification
-
     async def _run_agent(
         self,
         initial_messages: list[dict],
@@ -1473,6 +930,8 @@ End your response with exactly:
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> AgentRunResult:
         """Run a shared agent iteration loop and return the full result.
 
@@ -1490,35 +949,87 @@ End your response with exactly:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
         )
+        all_extra_hooks = [*self._extra_hooks, *(extra_hooks or [])]
         hook: AgentHook = (
-            _LoopHookChain(loop_hook, self._extra_hooks)
-            if self._extra_hooks
+            _LoopHookChain(loop_hook, all_extra_hooks)
+            if all_extra_hooks
             else loop_hook
         )
 
-        result = await self.runner.run(AgentRunSpec(
-            initial_messages=initial_messages,
-            tools=tools or self.tools,
-            model=self.model,
-            max_iterations=max_iterations or self.max_iterations,
-            hook=hook,
-            error_message="Sorry, I encountered an error calling the AI model.",
-            concurrent_tools=True,
-            tool_result_clearing_keep=(
-                None if preserve_tool_results else self.tool_result_clearing_keep
-            ),
-            tool_result_clear_trigger_tokens=(
-                None if preserve_tool_results else self._tool_result_clear_thresholds()[0]
-            ),
-            tool_result_clear_target_tokens=(
-                None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
-            ),
-            tool_policy=tool_policy,
-            max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
-            budget_manager=self.budget_manager,  # Pass unified budget manager for mid-loop enforcement
-        ))
+        base_tools = tools if tools is not None else self.tools
+        runner_tools = (
+            _ContextualToolRegistry(base_tools, turn_context)
+            if turn_context is not None
+            else base_tools
+        )
+        try:
+            result = await self.runner.run(AgentRunSpec(
+                initial_messages=initial_messages,
+                tools=runner_tools,
+                model=self.model,
+                max_iterations=max_iterations or self.max_iterations,
+                hook=hook,
+                error_message="Sorry, I encountered an error calling the AI model.",
+                concurrent_tools=True,
+                tool_result_clearing_keep=(
+                    None if preserve_tool_results else self.tool_result_clearing_keep
+                ),
+                tool_result_clear_trigger_tokens=(
+                    None if preserve_tool_results else self._tool_result_clear_thresholds()[0]
+                ),
+                tool_result_clear_target_tokens=(
+                    None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
+                ),
+                tool_policy=tool_policy,
+                max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
+                budget_manager=self.budget_manager,  # Pass unified budget manager for mid-loop enforcement
+            ))
+        except _TurnStopError as stop:
+            context_messages = turn_context.messages if turn_context is not None else initial_messages
+            context_tools = turn_context.tools_used if turn_context is not None else []
+            context_usage = (
+                turn_context.metadata.get("_turn_usage", {})
+                if turn_context is not None
+                else {}
+            )
+            context_events = (
+                turn_context.metadata.get("_turn_tool_events", [])
+                if turn_context is not None
+                else []
+            )
+            result = AgentRunResult(
+                final_content=(
+                    stop.content
+                    if isinstance(stop.content, str)
+                    else str(stop.content or "")
+                ),
+                messages=context_messages,
+                tools_used=list(context_tools),
+                usage=dict(context_usage),
+                stop_reason=stop.stop_reason,
+                tool_events=list(context_events),
+                policy_metadata=dict(stop.policy_metadata),
+            )
         self._last_usage = result.usage
+        if turn_context is not None:
+            turn_context.messages = result.messages
+            turn_context.tools_used = list(result.tools_used)
+            turn_context.tool_results = list(result.tool_events)
+            marker = turn_context.metadata.get("_tool_stop_reason")
+            if marker and result.stop_reason in {"completed", "max_iterations"}:
+                result.stop_reason = str(marker)
+                stop_content = turn_context.metadata.get("_tool_stop_content")
+                if stop_content is not None:
+                    result.final_content = (
+                        stop_content
+                        if isinstance(stop_content, str)
+                        else str(stop_content)
+                    )
+                result.policy_metadata = dict(
+                    turn_context.metadata.get("_tool_policy_metadata") or {}
+                )
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", max_iterations or self.max_iterations)
         elif result.stop_reason == "error":
@@ -1539,6 +1050,8 @@ End your response with exactly:
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         result = await self._run_agent(
             initial_messages,
@@ -1552,6 +1065,8 @@ End your response with exactly:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
+            extra_hooks=extra_hooks,
         )
         return result.final_content, result.tools_used, result.messages
 
@@ -1559,7 +1074,6 @@ End your response with exactly:
         self,
         initial_messages: list[dict[str, Any]],
         *,
-        task_text: str,
         session_key: str = "cli:direct",
         channel: str,
         chat_id: str,
@@ -1568,24 +1082,23 @@ End your response with exactly:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         approval_granted: bool = False,
-        planned: _PlanDecision | None = None,
-        skip_verification: bool = False,
         tools: ToolRegistry | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> AgentRunResult:
+        """Run the single main-agent orchestrator loop."""
         policy = RiskyActionPolicy(
             workspace=self.workspace,
             approval_granted=approval_granted,
             context_manager=self.context_manager,
         )
-        verification_goal = self._planner_verification_goal(task_text, planned)
         logger.info(
-            "Action phase started for {}:{} planned_handoff={} approval_granted={}",
+            "Orchestrator run started for {}:{} approval_granted={}",
             channel,
             chat_id,
-            bool(planned and planned.has_handoff),
             approval_granted,
         )
-        result = await self._run_agent(
+        return await self._run_agent(
             initial_messages,
             on_progress=on_progress,
             on_stream=on_stream,
@@ -1596,99 +1109,9 @@ End your response with exactly:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
+            extra_hooks=extra_hooks,
         )
-        if result.stop_reason == "approval_required":
-            logger.info("Action phase paused for approval on {}:{}", channel, chat_id)
-            return result
-
-        if skip_verification or not self._should_verify(task_text, result.tools_used, planned):
-            logger.info(
-                "Verification skipped for {}:{} tools_used={} planned_handoff={}",
-                channel,
-                chat_id,
-                len(result.tools_used),
-                bool(planned and planned.has_handoff),
-            )
-            return result
-
-        verification = await self._run_internal_verifier(
-            result.messages,
-            goal=verification_goal,
-            channel=channel,
-            chat_id=chat_id,
-        )
-        if verification.verdict == "PASS":
-            logger.info("Action phase accepted after initial verification on {}:{}", channel, chat_id)
-            return result
-
-        logger.info(
-            "Revision phase started for {}:{} after verifier verdict={}",
-            channel,
-            chat_id,
-            verification.verdict,
-        )
-        revision_messages = list(result.messages)
-        revision_messages.append({
-            "role": "user",
-            "content": (
-                "[Internal verification feedback]\n"
-                f"Verdict: {verification.verdict}\n"
-                f"Issues: {'; '.join(verification.issues) or 'None'}\n"
-                f"Feedback: {verification.feedback or 'Revise and verify your work carefully.'}\n\n"
-                "Please revise the work and produce the final response."
-            ),
-        })
-        revised = await self._run_agent(
-            revision_messages,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            tools=tools,
-            tool_policy=RiskyActionPolicy(workspace=self.workspace, approval_granted=True),
-            channel=channel,
-            chat_id=chat_id,
-            message_id=message_id,
-            session_key=session_key,
-        )
-        if revised.stop_reason == "approval_required":
-            return revised
-
-        final_verification = await self._run_internal_verifier(
-            revised.messages,
-            goal=verification_goal,
-            channel=channel,
-            chat_id=chat_id,
-        )
-        if final_verification.verdict == "PASS":
-            logger.info("Revision phase accepted after final verification on {}:{}", channel, chat_id)
-            return revised
-
-        logger.warning(
-            "Revision phase ended with non-pass verification on {}:{} verdict={} issues={}",
-            channel,
-            chat_id,
-            final_verification.verdict,
-            len(final_verification.issues),
-        )
-        note = (
-            "\n\nVerification status: "
-            f"{final_verification.verdict}. "
-            f"{final_verification.feedback or 'Some issues may remain.'}"
-        )
-        revised.final_content = (revised.final_content or "").rstrip() + note
-        if revised.messages and revised.messages[-1].get("role") == "assistant" and not revised.messages[-1].get("tool_calls"):
-            revised.messages[-1] = build_assistant_message(revised.final_content)
-        else:
-            revised.messages.append(build_assistant_message(revised.final_content))
-        revised.stop_reason = "verification_partial"
-        revised.policy_metadata = {
-            **revised.policy_metadata,
-            "verification": {
-                "verdict": final_verification.verdict,
-                "issues": final_verification.issues,
-            },
-        }
-        return revised
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1720,6 +1143,9 @@ End your response with exactly:
                 ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
                 result = await self.commands.dispatch_priority(ctx)
                 if result:
+                    if msg.channel == "cli":
+                        result.metadata = dict(result.metadata or {})
+                        result.metadata["_cli_turn_complete"] = True
                     await self.bus.publish_outbound(result)
                 continue
             task = asyncio.create_task(self._dispatch(msg))
@@ -1728,9 +1154,19 @@ End your response with exactly:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
-        gate = self._concurrency_gate or nullcontext()
-        async with lock, gate:
+        # ``execute_turn`` owns both the authoritative session lock and the
+        # cross-session concurrency gate.  Keep this adapter's indentation and
+        # publication behavior while avoiding a second lock around the runner.
+        # A direct test/integration replacement of ``_process_message`` predates
+        # the canonical adapter and still needs the compatibility lock.
+        process_impl = getattr(self._process_message, "__func__", None)
+        if process_impl is AgentLoop._process_message:
+            dispatch_lock = nullcontext()
+            dispatch_gate = nullcontext()
+        else:
+            dispatch_lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+            dispatch_gate = self._concurrency_gate or nullcontext()
+        async with dispatch_lock, dispatch_gate:
             try:
                 on_stream = on_stream_end = None
                 stream_content_published = False
@@ -1744,12 +1180,8 @@ End your response with exactly:
                     if msg.channel != "cli":
                         task_update_mode = self._channel_task_update_mode(msg.channel)
                         stream_progress_enabled = (task_update_mode == "verbose")
-                        # Result mode must wait for the complete action/verification/
-                        # revision cycle before exposing terminal streamed content.
-                        defer_terminal_stream_until_completion = task_update_mode in {
-                            "result",
-                            "plan_result",
-                        }
+                        # Result mode exposes only the completed turn.
+                        defer_terminal_stream_until_completion = task_update_mode == "result"
 
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
@@ -1829,20 +1261,27 @@ End your response with exactly:
                     if response.metadata.get("_streamed") and not stream_content_published:
                         response.metadata = dict(response.metadata)
                         response.metadata.pop("_streamed", None)
+                    if msg.channel == "cli":
+                        response.metadata = dict(response.metadata or {})
+                        response.metadata["_cli_turn_complete"] = True
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
+                    meta = dict(msg.metadata or {})
+                    meta["_cli_turn_complete"] = True
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
+                        content="", metadata=meta,
                     ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                meta = {"_cli_turn_complete": True} if msg.channel == "cli" else {}
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
+                    metadata=meta,
                 ))
 
     async def close_mcp(self) -> None:
@@ -1856,6 +1295,7 @@ End your response with exactly:
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+        await self.delegation.close()
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
@@ -1883,6 +1323,477 @@ End your response with exactly:
                 task.cancel()
         self._background_tasks.clear()
 
+    @staticmethod
+    def _request_route(request: TurnRequest) -> tuple[str, str, str, DeliveryTarget]:
+        """Resolve one request's session key and visible delivery target."""
+        target = request.delivery_target or request.route
+        channel = target.channel if target is not None else ""
+        chat_id = (
+            target.chat_id or target.to or target.recipient
+            if target is not None
+            else ""
+        )
+        key = request.session_key
+        if not key:
+            key = f"{channel}:{chat_id}" if channel and chat_id else "cli:direct"
+        if not channel or not chat_id:
+            inferred_channel, separator, inferred_chat = key.partition(":")
+            channel = inferred_channel if separator else "cli"
+            chat_id = inferred_chat if separator else key
+        if target is None or not target.channel or not (
+            target.chat_id or target.to or target.recipient
+        ):
+            target = DeliveryTarget(
+                channel=channel,
+                chat_id=chat_id,
+                message_id=target.message_id if target is not None else None,
+            )
+        return key, channel, chat_id, target
+
+    @staticmethod
+    def _new_run_id(requested: str | None) -> str:
+        if requested and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", requested):
+            return requested
+        import uuid
+
+        return uuid.uuid4().hex
+
+    @staticmethod
+    def _run_status(stop_reason: str | None) -> RunStatus:
+        return {
+            "completed": RunStatus.COMPLETED,
+            "approval_required": RunStatus.APPROVAL_REQUIRED,
+            "policy_blocked": RunStatus.POLICY_BLOCKED,
+            "tool_error": RunStatus.TOOL_ERROR,
+            "max_iterations": RunStatus.MAX_ITERATIONS,
+            "cancelled": RunStatus.CANCELLED,
+            "error": RunStatus.ERROR,
+        }.get(stop_reason or "completed", RunStatus.COMPLETED)
+
+    def _finalize_run_record(
+        self,
+        record: RunRecord,
+        context: TurnContext,
+        result: TurnResult,
+        *,
+        status: RunStatus | None = None,
+    ) -> RunRecord:
+        """Persist a terminal, sanitized record and attach it to the result."""
+        record.status = status or result.status
+        record.updated_at = datetime.now(timezone.utc).isoformat()
+        record.completed_at = datetime.now(timezone.utc).isoformat()
+        record.stop_reason = result.stop_reason
+        record.tools_used = tuple(result.tools_used or context.tools_used)
+        record.usage = dict(result.usage or {})
+        if result.error:
+            record.error_type = "error"
+        if context.session_key and (
+            record.session_ref is None or record.session_ref.session_key != context.session_key
+        ):
+            record.session_ref = SessionRunRef(session_key=context.session_key, run_id=record.run_id)
+            record.detail_ref = record.session_ref
+            record.session_key = context.session_key
+        record = self.run_store.save(record)
+        result.record = record
+        return record
+
+    async def execute_turn(
+        self,
+        request: TurnRequest,
+        *,
+        _tools: ToolRegistry | None = None,
+    ) -> TurnResult:
+        """Execute exactly one canonical, serialized agent turn."""
+        if not isinstance(request, TurnRequest):
+            raise TypeError("execute_turn expects a TurnRequest")
+
+        requested_key, channel, chat_id, target = self._request_route(request)
+        approval = await self._snapshot_approval(requested_key, request.content)
+        key = approval.effective_key
+        run_id = self._new_run_id(request.run_id)
+        started_at = datetime.now(timezone.utc)
+        context = TurnContext(
+            request=request,
+            run_id=run_id,
+            started_at=started_at,
+            session_key=key,
+            delegation_budget=self.delegation.new_budget(),
+            policy=RunPolicyContext(
+                approval_grant=request.approval_grant or (
+                    request.approval if request.approval.granted else None
+                ),
+                workspace=self.workspace,
+                approval_granted=bool(request.approval.granted),
+                source=request.source,
+                context_manager=self.context_manager,
+            ),
+            delivery=DeliveryState(primary=target, target=target),
+            lock_owner=f"main:{key}",
+            metadata=dict(request.metadata or {}),
+        )
+        # ``TurnRequest`` carries approval under both compatibility names; the
+        # explicit grant wins when present.
+        if request.approval_grant is not None:
+            context.policy.approval_granted = bool(request.approval_grant.granted)
+        elif request.approval.granted:
+            context.policy.approval_granted = True
+
+        record = RunRecord(
+            run_id=run_id,
+            status=RunStatus.RUNNING,
+            source=request.source,
+            detail_ref=SessionRunRef(session_key=key, run_id=run_id),
+            session_ref=SessionRunRef(session_key=key, run_id=run_id),
+            visible_session_key=request.scheduled_link.visible_session_key
+            if request.scheduled_link is not None and request.scheduled_link.visible_session_key
+            else f"{channel}:{chat_id}",
+            resumed_run_id=(
+                request.approval_grant.resumed_run_id
+                if request.approval_grant is not None
+                else None
+            ),
+            started_at=started_at.isoformat(),
+            updated_at=started_at.isoformat(),
+            metadata=dict(request.metadata or {}),
+            delivery_target=target,
+            scheduled_link=request.scheduled_link,
+        )
+        self.run_store.save(record)
+
+        lock = self._session_locks.setdefault(key, asyncio.Lock())
+        gate = self._concurrency_gate or nullcontext()
+        token = set_current_turn_context(context)
+        result: TurnResult | None = None
+        try:
+            async with lock, gate:
+                if approval.pending is not None and approval.action in {
+                    "affirmative",
+                    "negative",
+                    "other",
+                }:
+                    async with self._approval_guard:
+                        current = self._pending_approvals.get(approval.alias_key)
+                        if current is not approval.pending:
+                            result = TurnResult(
+                                run_id=run_id,
+                                status=RunStatus.CANCELLED,
+                                content=_STALE_APPROVAL_MESSAGE,
+                                final_content=_STALE_APPROVAL_MESSAGE,
+                                stop_reason="approval_stale",
+                                outbound=OutboundMessage(
+                                    channel=channel,
+                                    chat_id=chat_id,
+                                    content=_STALE_APPROVAL_MESSAGE,
+                                    metadata=dict(request.metadata or {}),
+                                ),
+                                messages=[],
+                            )
+                        else:
+                            self._remove_pending_approval_identity_locked(approval.pending)
+                            if approval.action == "negative":
+                                result = TurnResult(
+                                    run_id=run_id,
+                                    status=RunStatus.CANCELLED,
+                                    content="Cancelled the pending risky action.",
+                                    final_content="Cancelled the pending risky action.",
+                                    stop_reason="cancelled",
+                                    outbound=OutboundMessage(
+                                        channel=channel,
+                                        chat_id=chat_id,
+                                        content="Cancelled the pending risky action.",
+                                        metadata=dict(request.metadata or {}),
+                                    ),
+                                    messages=[],
+                                )
+                            elif approval.action == "affirmative":
+                                context.policy.approval_granted = True
+
+                if result is None:
+                    await self._connect_mcp()
+                    result = await self._execute_turn_locked(
+                        request,
+                        context,
+                        record,
+                        channel=channel,
+                        chat_id=chat_id,
+                        tools=_tools,
+                        approval_action=approval.action,
+                        approval_pending=approval.pending,
+                    )
+        except asyncio.CancelledError:
+            context.cancelled = True
+            cancelled = TurnResult(
+                run_id=run_id,
+                status=RunStatus.CANCELLED,
+                stop_reason="cancelled",
+                error="turn cancelled",
+                content=None,
+                final_content=None,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, cancelled, status=RunStatus.CANCELLED)
+            raise
+        except PromptBudgetExceeded as exc:
+            # Budget failures are deterministic local validation outcomes. Do
+            # not log a traceback here: traceback formatting can expose the
+            # oversized message payload through local-variable rendering.
+            result = TurnResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                content=None,
+                final_content=None,
+                stop_reason="prompt_budget_exceeded",
+                error=str(exc),
+                outbound=None,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, result, status=RunStatus.ERROR)
+            callback = request.callbacks.on_error
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        except Exception as exc:
+            logger.exception("Error executing canonical turn {}", run_id)
+            error = f"Error: {type(exc).__name__}: {exc}"
+            outbound = OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="Sorry, I encountered an error.",
+                metadata=dict(request.metadata or {}),
+            )
+            result = TurnResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                content=outbound.content,
+                final_content=outbound.content,
+                stop_reason="error",
+                error=error,
+                outbound=outbound,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, result, status=RunStatus.ERROR)
+            callback = request.callbacks.on_error
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        else:
+            if (
+                result is not None
+                and result.status is not RunStatus.COMMAND
+                and result.stop_reason not in {"cancelled", "approval_stale"}
+                and self._should_mirror_task_session(
+                    context.session_key or key,
+                    f"{channel}:{chat_id}",
+                )
+            ):
+                visible_key = f"{channel}:{chat_id}"
+                visible_lock = self._session_locks.setdefault(visible_key, asyncio.Lock())
+                async with visible_lock:
+                    self._mirror_task_session_to_visible_chat(
+                        session_key=context.session_key or key,
+                        channel=channel,
+                        chat_id=chat_id,
+                        task_text=str(
+                            context.metadata.get("_mirror_task_text", request.content)
+                        ),
+                        response_text=result.content or result.final_content or "",
+                        approval_granted=bool(context.policy.approval_granted),
+                        run_id=context.run_id,
+                        status=getattr(result.status, "value", str(result.status)),
+                        stop_reason=result.stop_reason,
+                        occurrence_id=(
+                            request.scheduled_link.occurrence_id
+                            if request.scheduled_link is not None
+                            else None
+                        ),
+                    )
+            assert result is not None
+            result.run_id = run_id
+            result.sent_messages = tuple(context.delivery.sent_messages)
+            result.policy_metadata = result.policy_metadata or context.policy.metadata
+            self._finalize_run_record(record, context, result)
+            callback = request.callbacks.on_error if result.error else request.callbacks.on_complete
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        finally:
+            reset_current_turn_context(token)
+        return result
+
+    async def _execute_turn_locked(
+        self,
+        request: TurnRequest,
+        context: TurnContext,
+        record: RunRecord,
+        *,
+        channel: str,
+        chat_id: str,
+        tools: ToolRegistry | None = None,
+        approval_action: str = "none",
+        approval_pending: _PendingApproval | None = None,
+    ) -> TurnResult:
+        """Run the canonical body after ``execute_turn`` acquires its locks."""
+        msg = InboundMessage(
+            channel=channel,
+            sender_id=request.sender_id,
+            chat_id=chat_id,
+            content=request.content,
+            media=list(request.media),
+            metadata=dict(request.metadata or {}),
+            session_key_override=context.session_key
+            if context.session_key != f"{channel}:{chat_id}"
+            else None,
+        )
+
+        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        key = context.session_key or msg.session_key
+        session = self.sessions.get_or_create(key)
+        raw = msg.content.strip()
+        command_context = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if command_result := await self.commands.dispatch(command_context):
+            return TurnResult(
+                run_id=context.run_id,
+                status=RunStatus.COMMAND,
+                content=command_result.content,
+                final_content=command_result.content,
+                outbound=command_result,
+                messages=[],
+            )
+
+        history = (
+            []
+            if request.history_mode is HistoryMode.FRESH
+            else session.get_model_history(max_messages=0)
+        )
+        current_message = msg.content
+        if approval_action == "affirmative" and approval_pending is not None:
+            current_message = (
+                "The user approved the previously blocked risky action. "
+                f"Resume the task that required approval: {approval_pending.summary}."
+                f"\n\nOriginal approval reply: {msg.content}"
+            )
+        context.metadata["_mirror_task_text"] = current_message
+
+        effective_tools = tools if tools is not None else (
+            self.tools.filtered(list(request.tool_names))
+            if request.tool_names is not None
+            else self.tools
+        )
+        tool_names_set = (
+            set(effective_tools.tool_names) if effective_tools is not self.tools else None
+        )
+        initial_messages = self.context.build_messages(
+            history=history,
+            current_message=current_message,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            tool_names=tool_names_set,
+            inject_memory=True,
+        )
+        if self.budget_manager is not None:
+            initial_messages = await self.budget_manager.enforce_budget(
+                initial_messages,
+                preserve_last_n_turns=self.tool_result_clearing_keep,
+            )
+        save_from = len(initial_messages) - 1
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=meta,
+            ))
+
+        result = await self._run_main_task(
+            initial_messages,
+            session_key=key,
+            on_progress=request.callbacks.on_progress or _bus_progress,
+            on_stream=request.callbacks.on_stream,
+            on_stream_end=request.callbacks.on_stream_end,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            message_id=target_message_id(context.delivery.primary),
+            approval_granted=bool(context.policy.approval_granted),
+            tools=effective_tools,
+            turn_context=context,
+            extra_hooks=list(request.hooks),
+        )
+        final_content = result.final_content or "I've completed processing but have no response to give."
+        context.tools_used = list(result.tools_used)
+        self._save_turn(session, result.messages, save_from, run_id=context.run_id)
+        self.sessions.save(session)
+        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        if key.startswith("cron:"):
+            await self._sync_context_repos()
+        else:
+            self._maybe_sync_context_repo()
+
+        if result.stop_reason == "approval_required":
+            summary = str(result.policy_metadata.get("summary") or "risky action")
+            await self._store_pending_approval(
+                session_key=key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                summary=summary,
+            )
+        primary = context.delivery.primary or context.delivery.target
+        primary_chat = primary.chat_id or primary.to or primary.recipient if primary else None
+        final_text = final_content.strip() if isinstance(final_content, str) else ""
+        sent_to_primary = any(
+            sent.channel == primary.channel
+            and sent.chat_id == primary_chat
+            and isinstance(sent.content, str)
+            and bool(sent.content.strip())
+            and bool(final_text)
+            and sent.content.strip() == final_text
+            for sent in context.delivery.sent_messages
+        ) if primary else False
+        outbound: OutboundMessage | None
+        if sent_to_primary:
+            outbound = None
+        else:
+            meta = dict(msg.metadata or {})
+            if request.callbacks.on_stream is not None and result.stop_reason != "approval_required":
+                meta["_streamed"] = True
+            outbound = OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+                metadata=meta,
+            )
+        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, final_content[:120])
+        return TurnResult(
+            run_id=context.run_id,
+            status=self._run_status(result.stop_reason),
+            content=final_content,
+            final_content=final_content,
+            stop_reason=result.stop_reason,
+            error=result.error,
+            usage=result.usage,
+            tools_used=list(result.tools_used),
+            outbound=outbound,
+            policy_metadata=result.policy_metadata,
+            messages=result.messages,
+        )
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1890,268 +1801,65 @@ End your response with exactly:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        planning_mode_override: str | None = None,
-        skip_verification: bool = False,
         approval_granted: bool = False,
         tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
-        """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        """Compatibility adapter around :meth:`execute_turn`."""
+        source = TurnSource.SYSTEM_COMPAT if msg.channel == "system" else TurnSource.GATEWAY
         if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), key)
-            history = session.get_history(max_messages=0)
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-                current_role=current_role,
-            )
-
-            if self.max_tokens.input > 0:
-                try:
-                    sys_tool_defs = self.tools.get_definitions()
-                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, sys_tool_defs)
-                    if tokens > self.max_tokens.input:
-                        logger.warning(
-                            "System context size ({}) exceeds maxTokens.input ({}). Trimming oldest turns.",
-                            tokens,
-                            self.max_tokens.input,
-                        )
-                        while tokens > self.max_tokens.input and history:
-                            history.pop(0)
-                            messages = self.context.build_messages(
-                                history=history,
-                                current_message=msg.content,
-                                channel=channel,
-                                chat_id=chat_id,
-                                current_role=current_role,
-                            )
-                            tokens, _ = estimate_prompt_tokens_chain(
-                                self.provider,
-                                self.model,
-                                messages,
-                                sys_tool_defs,
-                            )
-                except Exception as e:
-                    logger.error("Failed to check system token count: {}", e)
-
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-                session_key=key,
-            )
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
-            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-            self._maybe_sync_context_repo()
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=final_content or "Background task completed.",
-            )
-
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
-        if msg.channel != "system" and self._PLANNER_HANDOFF_METADATA_KEY in session.metadata:
-            logger.info("Clearing stale planner handoff for session {}", key)
-            self._clear_planner_handoff(session)
-            self.sessions.save(session)
-
-        # Slash commands
-        raw = msg.content.strip()
-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
-            return result
-
-        pending = self._pending_approvals.get(key)
-        approval_note: str | None = None
-        if pending:
-            if self._is_affirmative(raw):
-                if pending.session_key != key:
-                    key = pending.session_key
-                    session = self.sessions.get_or_create(key)
-                approval_note = (
-                    "The user approved the previously blocked risky action. "
-                    f"Resume the task that required approval: {pending.summary}."
-                )
-                self._clear_pending_approval(key, pending)
-            elif self._is_negative(raw):
-                self._clear_pending_approval(key, pending)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Cancelled the pending risky action.",
-                    metadata=msg.metadata or {},
-                )
+            if ":" in msg.chat_id:
+                route_channel, route_chat = msg.chat_id.split(":", 1)
             else:
-                # A new request supersedes the older pending approval.
-                self._clear_pending_approval(key, pending)
-
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), key)
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
-
-        history = session.get_history(max_messages=0)
-        current_message = msg.content
-        if approval_note:
-            current_message = f"{approval_note}\n\nOriginal approval reply: {msg.content}"
-
-        # Use filtered tool set if provided, otherwise full set.
-        effective_tools = tools if tools is not None else self.tools
-        tool_names_set = set(effective_tools.tool_names) if tools is not None else None
-
-        # Unified context model: memory injected as [Past Knowledge] message
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=current_message,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-            tool_names=tool_names_set,
-            inject_memory=True,
-        )
-        tool_defs = effective_tools.get_definitions()
-        
-        # Enforce budget using unified manager (handles all reduction strategies)
-        if self.budget_manager is not None:
-            initial_messages = await self.budget_manager.enforce_budget(
-                initial_messages,
-                preserve_last_n_turns=self.tool_result_clearing_keep,
+                route_channel, route_chat = "cli", msg.chat_id
+            compat_session_key = session_key or f"{route_channel}:{route_chat}"
+            warnings.warn(
+                "Deprecated system message compatibility adapter used; "
+                "use execute_turn(TurnRequest(...)) instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-
-        planned: _PlanDecision | None = None
-        effective_planning_mode = planning_mode_override if planning_mode_override is not None else self.planning_mode
-        if self._should_plan_with_mode(current_message, effective_planning_mode):
-            planned = await self._run_internal_planner(
-                initial_messages,
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+            logger.warning(
+                "Deprecated system message compatibility adapter used",
+                event="system_compat",
+                channel=route_channel,
+                chat_id=route_chat,
+                session_key=compat_session_key,
             )
-            if planned.decision in {"answer", "clarify"} and planned.response:
-                all_msgs = [*initial_messages, build_assistant_message(planned.response)]
-                self._save_turn(session, all_msgs, 1 + len(history))
-                self.sessions.save(session)
-                self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-                self._maybe_sync_context_repo()
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=planned.response,
-                    metadata=msg.metadata or {},
-                )
-            if planned.decision == "execute" and planned.has_handoff:
-                logger.info(
-                    "Planner handoff stored for session {} with {} reference items",
-                    key,
-                    len(planned.references),
-                )
-                self._store_planner_handoff(session, current_message, planned)
-                self.sessions.save(session)
-                handoff_text = self._planner_handoff_message(planned)
-                if initial_messages and initial_messages[0].get("role") == "system":
-                    # Append to the existing system message instead of inserting a new one.
-                    # Inserting a second system-role message causes the Anthropic provider to
-                    # overwrite the first (it takes the last system message seen), which strips
-                    # the agent's identity, workspace context, and tool knowledge.
-                    existing = initial_messages[0].get("content") or ""
-                    initial_messages[0] = {
-                        **initial_messages[0],
-                        "content": f"{existing}\n\n{handoff_text}",
-                    }
-                else:
-                    initial_messages.insert(0, {"role": "system", "content": handoff_text})
-                logger.info("Planner handoff injected into action context for session {}", key)
-                if (
-                    approval_note is None
-                    and self._channel_task_update_mode(msg.channel) == "plan_result"
-                ):
-                    plan_message = self._planner_user_message(planned)
-                    if plan_message:
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content=plan_message,
-                            metadata={
-                                **dict(msg.metadata or {}),
-                                "_intermediate": True,
-                            },
-                        ))
-
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
-        result = await self._run_main_task(
-            initial_messages,
-            task_text=current_message,
-            session_key=key,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
+        else:
+            route_channel, route_chat = msg.channel, msg.chat_id
+            compat_session_key = session_key or msg.session_key
+        route = DeliveryTarget(
+            channel=route_channel,
+            chat_id=route_chat,
             message_id=msg.metadata.get("message_id"),
-            approval_granted=approval_granted or approval_note is not None,
-            planned=planned,
-            skip_verification=skip_verification,
-            tools=tools,
         )
-        final_content = result.final_content
-        all_msgs = result.messages
-
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-
-        self._save_turn(session, all_msgs, 1 + len(history))
-        if planned and planned.decision == "execute":
-            logger.info("Clearing planner handoff after action/review cycle for session {}", key)
-            self._clear_planner_handoff(session)
-        self.sessions.save(session)
-        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-        self._maybe_sync_context_repo()
-
-        if result.stop_reason == "approval_required":
-            summary = str(result.policy_metadata.get("summary") or "risky action")
-            self._store_pending_approval(
-                session_key=key,
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                summary=summary,
-            )
-
-        self._mirror_task_session_to_visible_chat(
-            session_key=key,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            task_text=current_message,
-            response_text=final_content,
-            approval_granted=approval_granted or approval_note is not None,
+        grant = ApprovalGrant(approved=True, source="compat") if approval_granted else None
+        request = TurnRequest(
+            content=msg.content,
+            source=source,
+            session_key=compat_session_key,
+            route=route,
+            sender_id=msg.sender_id,
+            media=tuple(msg.media),
+            approval_grant=grant,
+            approval=grant or ApprovalGrant(),
+            callbacks=TurnCallbacks(
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            ),
+            metadata=dict(msg.metadata or {}),
+            tool_names=tuple(tools.tool_names) if tools is not None else None,
         )
-
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        meta = dict(msg.metadata or {})
-        if on_stream is not None and result.stop_reason != "approval_required":
-            meta["_streamed"] = True
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=meta,
-        )
+        result = await self.execute_turn(request, _tools=tools)
+        # Keep the legacy inspection properties useful for callers that still
+        # invoke ``_process_message`` directly.  Canonical execution itself
+        # uses only ``TurnResult.sent_messages`` and never reads these fields.
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool._sent_messages_in_turn = list(result.sent_messages)
+            message_tool._sent_in_turn = result.outbound is None and bool(result.sent_messages)
+        return result.outbound
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -2199,7 +1907,14 @@ End your response with exactly:
 
         return filtered
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
@@ -2225,8 +1940,6 @@ End your response with exactly:
                         entry["content"] = parts[1]
                     else:
                         continue
-                if isinstance(entry.get("content"), str) and entry["content"].startswith("[Internal verification feedback]"):
-                    continue
                 if (
                     isinstance(entry.get("content"), str)
                     and "Original approval reply:" in entry["content"]
@@ -2239,7 +1952,19 @@ End your response with exactly:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
+            if run_id:
+                # SessionManager strips this internal marker from model history
+                # while RunStore can resolve the detailed trace by run ID.
+                entry.pop("role", None)
+                entry.pop("_run_id", None)
+                session.add_run_message(
+                    run_id,
+                    str(role or "assistant"),
+                    entry.pop("content", ""),
+                    **entry,
+                )
+            else:
+                session.messages.append(entry)
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session: Session, archive_all: bool = False) -> bool:
@@ -2256,31 +1981,39 @@ End your response with exactly:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
         return True
 
-    def _maybe_sync_context_repo(self) -> None:
-        """If context repos are configured, schedule a background git sync for each."""
+    async def _sync_context_repos(self) -> bool:
+        """Sync configured context repos and report whether every sync succeeded."""
         repos = [repo for repo in self.context_manager.repos if repo.auto_sync]
         if not repos:
-            return
+            return True
         from nanobot.utils.git_sync import async_sync_context_repo
 
-        async def _sync() -> None:
-            try:
-                await asyncio.gather(
-                    *(
-                        async_sync_context_repo(
-                            repo.path,
-                            include_paths=repo.sync_include_patterns(),
-                            exclude_paths=repo.sync_exclude_patterns(),
-                            message=f"nanobot: sync {repo.name} context updates",
-                        )
-                        for repo in repos
-                    ),
-                    return_exceptions=False
+        try:
+            results = await asyncio.gather(
+                *(
+                    async_sync_context_repo(
+                        repo.path,
+                        include_paths=repo.sync_include_patterns(),
+                        exclude_paths=repo.sync_exclude_patterns(),
+                        message=f"nanobot: sync {repo.name} context updates",
+                    )
+                    for repo in repos
                 )
-            except Exception:
-                logger.exception("Context repo sync failed")
+            )
+        except Exception:
+            logger.exception("Context repo sync failed")
+            return False
 
-        self._schedule_background(_sync())
+        failed = [repo.name for repo, succeeded in zip(repos, results) if not succeeded]
+        if failed:
+            logger.error("Context repo sync did not complete for: {}", ", ".join(failed))
+            return False
+        return True
+
+    def _maybe_sync_context_repo(self) -> None:
+        """Schedule a background context-repository sync for interactive turns."""
+        if any(repo.auto_sync for repo in self.context_manager.repos):
+            self._schedule_background(self._sync_context_repos())
 
     async def process_direct(
         self,
@@ -2291,8 +2024,6 @@ End your response with exactly:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         approval_granted: bool = False,
         tool_names: list[str] | None = None,
     ) -> OutboundMessage | None:
@@ -2303,14 +2034,22 @@ End your response with exactly:
         system prompt token count — useful for lightweight scheduled tasks on
         resource-constrained devices.
         """
-        await self._connect_mcp()
         tools = self.tools.filtered(tool_names) if tool_names else None
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress,
-            on_stream=on_stream, on_stream_end=on_stream_end,
-            planning_mode_override=planning_mode,
-            skip_verification=skip_verification,
-            approval_granted=approval_granted,
-            tools=tools,
+        grant = ApprovalGrant(approved=True, source="direct") if approval_granted else None
+        request = TurnRequest(
+            content=content,
+            source=TurnSource.DIRECT,
+            session_key=session_key,
+            route=DeliveryTarget(channel=channel, chat_id=chat_id),
+            sender_id="user",
+            approval_grant=grant,
+            approval=grant or ApprovalGrant(),
+            callbacks=TurnCallbacks(
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            ),
+            tool_names=tuple(tool_names) if tool_names else None,
         )
+        result = await self.execute_turn(request, _tools=tools)
+        return result.outbound

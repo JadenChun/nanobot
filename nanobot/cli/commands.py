@@ -1,13 +1,12 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
-import shutil
 import select
+import shutil
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -470,6 +469,7 @@ def _make_provider(config: Config):
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens.output,
         reasoning_effort=defaults.reasoning_effort,
+        context_window_tokens=defaults.max_tokens.input,
     )
 
     fallback_entries = defaults.fallback
@@ -486,6 +486,31 @@ def _make_provider(config: Config):
     fallback = FallbackProvider(providers)
     fallback.generation = gen
     return fallback
+
+
+def _make_crawler_provider(config: Config):
+    """Create the optional crawler provider independently from the main agent."""
+    crawler = config.agents.crawler
+    from nanobot.agent.tools.social_crawl import crawl_tools_enabled
+
+    if not crawler.enabled or not crawl_tools_enabled():
+        return None
+    model = crawler.model or config.agents.defaults.model
+    provider_name = crawler.provider or config.get_provider_name(model)
+    if not provider_name:
+        console.print("[red]Error: No provider could be matched for the crawler model.[/red]")
+        raise typer.Exit(1)
+    provider = _make_single_provider(config, provider_name, model)
+
+    from nanobot.providers.base import GenerationSettings
+
+    provider.generation = GenerationSettings(
+        temperature=0.1,
+        max_tokens=crawler.max_tokens.output,
+        reasoning_effort=crawler.reasoning_effort,
+        context_window_tokens=crawler.max_tokens.input,
+    )
+    return provider
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -511,6 +536,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -567,6 +593,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -585,6 +612,7 @@ def serve(
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(runtime_config)
+    crawler_provider = _make_crawler_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
     agent_loop = AgentLoop(
         bus=bus,
@@ -593,9 +621,8 @@ def serve(
         model=runtime_config.agents.defaults.model,
         max_tokens=runtime_config.agents.defaults.max_tokens,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=runtime_config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=runtime_config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=runtime_config.agents.defaults.planner_max_parallel_explore_agents,
+        crawler_agent_config=runtime_config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=runtime_config.tools.web.search,
         web_proxy=runtime_config.tools.web.proxy or None,
         exec_config=runtime_config.tools.exec,
@@ -648,6 +675,186 @@ def _resolve_context_paths(config: Config) -> list[Path] | None:
     if not raw:
         return None
     return [Path(p).expanduser().resolve() for p in raw if p]
+
+
+def _link_cron_result_to_visible_chat(
+    agent_loop: Any,
+    *,
+    job: Any,
+    run_id: str | None,
+    visible_session_key: str,
+    instruction: str,
+    response: str,
+    status: str = "completed",
+    approval_granted: bool = False,
+    stop_reason: str | None = None,
+    occurrence_id: str | None = None,
+) -> None:
+    """Record a bounded scheduled result reference for the visible chat.
+
+    Cron execution keeps its complete, fresh-history trace in ``cron:<job>``.
+    This separate link is intentionally bounded and tagged with the canonical
+    run ID so normal chat history never receives another full scheduled turn.
+    """
+    if not run_id or not visible_session_key:
+        return
+
+    visible_session = agent_loop.sessions.get_or_create(visible_session_key)
+    existing = visible_session.get_run_messages(run_id)
+    if any(
+        message.get("role") == "user" and message.get("content") == instruction
+        for message in existing
+    ) and any(
+        message.get("role") == "assistant" and message.get("content") == response
+        for message in existing
+    ):
+        return
+
+    # Keep complete detail in the cron session.  The visible session receives
+    # only the bounded ring metadata; legacy wrapper pairs remain on disk and
+    # are filtered request-locally by ``Session.get_model_history``.
+    visible_session.add_scheduled_run(
+        job_id=str(job.id),
+        run_id=run_id,
+        instruction=instruction,
+        result=response,
+        detail_session_key=f"cron:{job.id}",
+        status=status,
+        approval_granted=approval_granted,
+        stop_reason=stop_reason,
+        occurrence_id=occurrence_id,
+    )
+    agent_loop.sessions.save(visible_session)
+
+
+async def _execute_cron_job(agent_loop: Any, bus: Any, job: Any) -> Any:
+    """Run one scheduled instruction through ``execute_turn`` and fan it out."""
+    from nanobot.agent.tools.message import MessageTool
+    from nanobot.agent.turn import (
+        ApprovalGrant,
+        DeliveryTarget,
+        HistoryMode,
+        ScheduledTurnLink,
+        TurnCallbacks,
+        TurnRequest,
+        TurnSource,
+    )
+    from nanobot.cron.delivery import build_explicit_fanout_messages, build_result_messages
+
+    delivery_destinations = job.payload.delivery_destinations()
+    route_channel = job.payload.channel or "cli"
+    route_chat = job.payload.to or "direct"
+    visible_session_key = f"{route_channel}:{route_chat}"
+    scheduled_link = ScheduledTurnLink(
+        job_id=job.id,
+        job_name=job.name,
+        instruction=job.payload.message,
+        visible_session_key=visible_session_key,
+        additional_destinations=tuple(
+            DeliveryTarget(channel=destination.channel, chat_id=destination.to)
+            for destination in delivery_destinations[1:]
+        ),
+        occurrence_id=str(
+            getattr(job, "_occurrence_id", job.state.last_run_at_ms or "")
+        ),
+    )
+
+    async def _silent_progress(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    request = TurnRequest(
+        content=job.payload.message,
+        source=TurnSource.CRON,
+        session_key=f"cron:{job.id}",
+        route=DeliveryTarget(channel=route_channel, chat_id=route_chat),
+        approval_grant=ApprovalGrant(approved=True, source="cron"),
+        history_mode=HistoryMode.FRESH,
+        scheduled_link=scheduled_link,
+        callbacks=TurnCallbacks(on_progress=_silent_progress),
+        metadata={"cron_job_id": job.id},
+    )
+    try:
+        result = await agent_loop.execute_turn(request)
+    except Exception as exc:
+        agent_loop.record_task_failure(
+            session_key=f"cron:{job.id}",
+            channel=route_channel,
+            chat_id=route_chat,
+            label=f"Scheduled task '{job.name}'",
+            task=job.payload.message,
+            error=str(exc),
+        )
+        raise
+
+    response = getattr(result, "content", None)
+    if response is None:
+        outbound = getattr(result, "outbound", None)
+        response = getattr(outbound, "content", None) if outbound else None
+    response = str(response or "Task completed.")
+    run_id = getattr(result, "run_id", None)
+    raw_status = getattr(result, "status", None)
+    status = getattr(raw_status, "value", raw_status)
+    if status is None:
+        status = getattr(result, "stop_reason", None) or "completed"
+    status = str(status)
+    stop_reason = getattr(result, "stop_reason", None)
+    missing_ledger = object()
+    raw_sent_messages = getattr(result, "sent_messages", missing_ledger)
+    if raw_sent_messages is missing_ledger:
+        # Compatibility for test/in-process loops that have not yet surfaced
+        # the canonical delivery ledger.
+        sent_messages = []
+        message_tool = agent_loop.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            sent_messages = list(message_tool.sent_messages_in_turn)
+    else:
+        # An empty canonical ledger is authoritative for this run.  Never
+        # borrow messages from the shared legacy MessageTool singleton.
+        sent_messages = list(raw_sent_messages or ())
+
+    _link_cron_result_to_visible_chat(
+        agent_loop,
+        job=job,
+        run_id=str(run_id) if run_id else None,
+        visible_session_key=visible_session_key,
+        instruction=job.payload.message,
+        response=response,
+        status=status,
+        approval_granted=bool(request.approval_grant and request.approval_grant.granted),
+        stop_reason=str(stop_reason) if stop_reason else None,
+        occurrence_id=(
+            getattr(job, "_occurrence_id", None)
+            or (str(job.state.last_run_at_ms) if job.state.last_run_at_ms else None)
+        ),
+    )
+    explicit_fanout = build_explicit_fanout_messages(
+        delivery_destinations,
+        sent_messages,
+    )
+    for outbound in explicit_fanout:
+        await bus.publish_outbound(outbound)
+
+    if delivery_destinations and response:
+        try:
+            # An explicit attachment or auxiliary message must never replace
+            # the completed text result of the scheduled task.
+            for outbound in build_result_messages(
+                response,
+                delivery_destinations,
+                [*sent_messages, *explicit_fanout],
+            ):
+                await bus.publish_outbound(outbound)
+        except Exception as exc:
+            agent_loop.record_task_failure(
+                session_key=f"cron:{job.id}",
+                channel=route_channel,
+                chat_id=route_chat,
+                label=f"Scheduled task delivery '{job.name}'",
+                task=job.payload.message,
+                error=str(exc),
+            )
+            raise
+    return result
 
 
 # ============================================================================
@@ -706,6 +913,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    crawler_provider = _make_crawler_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -724,9 +932,8 @@ def gateway(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=config.agents.defaults.planner_max_parallel_explore_agents,
+        crawler_agent_config=config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
@@ -748,103 +955,9 @@ def gateway(
     )
 
     # Set cron callback (needs agent)
-    async def on_cron_job(job: CronJob) -> str | None:
+    async def on_cron_job(job: CronJob) -> Any:
         """Execute a cron job through the agent."""
-        from nanobot.agent.tools.cron import CronTool
-        from nanobot.agent.tools.message import MessageTool
-        from nanobot.cron.delivery import build_explicit_fanout_messages, build_result_messages
-        from nanobot.utils.evaluator import evaluate_response
-
-        delivery_destinations = job.payload.delivery_destinations()
-
-        reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}\n\n"
-            "This is a fresh execution of this scheduled task. "
-            "Execute it now — do not simply echo a status update or say 'in progress'. "
-            "Either complete the task directly and deliver the result, "
-            "or use the spawn tool to start background work and confirm to the user that work has begun. "
-            "If the background task needs to modify workspace files, include write_scope with the "
-            "workspace-relative files or directories it may change."
-        )
-
-        # Clear stale history so previous "in progress" messages don't mislead this run.
-        # Only wipes messages — metadata is preserved and any stale planner handoff in
-        # metadata is auto-cleared by the loop when the new message arrives.
-        # Background subagents are asyncio tasks and are unaffected by this clearing.
-        cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
-        cron_session.retain_recent_legal_suffix(0)
-        agent.sessions.save(cron_session)
-
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-        try:
-            try:
-                resp = await agent.process_direct(
-                    reminder_note,
-                    session_key=f"cron:{job.id}",
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to or "direct",
-                    planning_mode=job.payload.planning_mode,
-                    skip_verification=job.payload.skip_verification,
-                    approval_granted=True,
-                )
-            except Exception as exc:
-                agent.record_task_failure(
-                    session_key=f"cron:{job.id}",
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to or "direct",
-                    label=f"Scheduled task '{job.name}'",
-                    task=job.payload.message,
-                    error=str(exc),
-                )
-                raise
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-
-        response = resp.content if resp else ""
-
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            for outbound in build_explicit_fanout_messages(
-                delivery_destinations,
-                message_tool.sent_messages_in_turn,
-            ):
-                await bus.publish_outbound(outbound)
-            return response
-
-        if delivery_destinations and response:
-            try:
-                should_notify = await evaluate_response(
-                    response, job.payload.message, provider, agent.model,
-                )
-                if should_notify:
-                    sent_messages = (
-                        message_tool.sent_messages_in_turn
-                        if isinstance(message_tool, MessageTool)
-                        else ()
-                    )
-                    for outbound in build_result_messages(
-                        response,
-                        delivery_destinations,
-                        sent_messages,
-                    ):
-                        await bus.publish_outbound(outbound)
-            except Exception as exc:
-                agent.record_task_failure(
-                    session_key=f"cron:{job.id}",
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to or "direct",
-                    label=f"Scheduled task delivery '{job.name}'",
-                    task=job.payload.message,
-                    error=str(exc),
-                )
-                raise
-        return response
+        return await _execute_cron_job(agent, bus, job)
     cron.on_job = on_cron_job
 
     # Create channel manager
@@ -869,26 +982,40 @@ def gateway(
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
+        from nanobot.agent.turn import DeliveryTarget, TurnCallbacks, TurnRequest, TurnSource
+
         channel, chat_id = _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
 
-        resp = await agent.process_direct(
-            tasks,
+        result = await agent.execute_turn(TurnRequest(
+            content=tasks,
+            source=TurnSource.HEARTBEAT,
             session_key="heartbeat",
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,
-        )
+            route=DeliveryTarget(channel=channel, chat_id=chat_id),
+            callbacks=TurnCallbacks(on_progress=_silent),
+        ))
 
         # Keep a small tail of heartbeat history so the loop stays bounded
         # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
-        agent.sessions.save(session)
+        from nanobot.session.manager import SessionWriteConflict
 
-        return resp.content if resp else ""
+        for _attempt in range(3):
+            session = agent.sessions.get_or_create("heartbeat")
+            session.retain_recent_legal_suffix(
+                hb_cfg.keep_recent_messages,
+                expected_revision=session.revision,
+            )
+            try:
+                agent.sessions.save(session)
+                break
+            except SessionWriteConflict:
+                agent.sessions.invalidate("heartbeat")
+        else:
+            raise SessionWriteConflict()
+
+        return str(getattr(result, "content", None) or "")
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
@@ -1022,6 +1149,11 @@ def agent(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    log_file: str | None = typer.Option(
+        None,
+        "--log-file",
+        help="Write runtime logs to this file (rotated at 20 MB, 7 days kept)",
+    ),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -1035,6 +1167,7 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    crawler_provider = _make_crawler_provider(config)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -1044,17 +1177,29 @@ def agent(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
-    if logs:
-        # Remove default handler and add a dynamic stderr writer
-        # This allows prompt_toolkit.patch_stdout to intercept background logs
-        # so they don't overwrite the "You: " prompt.
+    if logs or log_file:
         logger.remove()
-        logger.add(
-            lambda msg: sys.stderr.write(msg),
-            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        )
+        if logs:
+            # Let prompt_toolkit intercept runtime logs so they do not overwrite
+            # the interactive input prompt.
+            logger.add(
+                lambda msg: sys.stderr.write(msg),
+                format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            )
+        if log_file:
+            logger.add(
+                log_file,
+                rotation="20 MB",
+                retention="7 days",
+                compression="gz",
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+                enqueue=True,
+            )
         logger.enable("nanobot")
-        console.print("[dim]Runtime logs enabled (--logs). Use --no-logs to hide internal logs.[/dim]")
+        if logs:
+            console.print("[dim]Runtime logs enabled (--logs). Use --no-logs to hide internal logs.[/dim]")
+        if log_file:
+            console.print(f"[dim]Logging to {log_file}[/dim]")
     else:
         logger.disable("nanobot")
 
@@ -1065,9 +1210,8 @@ def agent(
         model=config.agents.defaults.model,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        planner_max_iterations=config.agents.defaults.planner_max_iterations,
-        planner_explore_subagent_max_iterations=config.agents.defaults.planner_explore_subagent_max_iterations,
-        planner_max_parallel_explore_agents=config.agents.defaults.planner_max_parallel_explore_agents,
+        crawler_agent_config=config.agents.crawler,
+        crawler_provider=crawler_provider,
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         agent_browser_config=config.tools.agent_browser,
@@ -1099,19 +1243,37 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            from nanobot.agent.turn import DeliveryTarget, TurnCallbacks, TurnRequest, TurnSource
+
+            if ":" in session_id:
+                route_channel, route_chat = session_id.split(":", 1)
+            else:
+                route_channel, route_chat = "cli", session_id
             renderer = StreamRenderer(render_markdown=markdown, use_live=not logs)
-            response = await agent_loop.process_direct(
-                message, session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
+            response = await agent_loop.execute_turn(TurnRequest(
+                content=message,
+                source=TurnSource.DIRECT,
+                session_key=session_id,
+                route=DeliveryTarget(channel=route_channel, chat_id=route_chat),
+                callbacks=TurnCallbacks(
+                    on_progress=_cli_progress,
+                    on_stream=renderer.on_delta,
+                    on_stream_end=renderer.on_end,
+                ),
+            ))
+            outbound = getattr(response, "outbound", None)
+            response_content = getattr(response, "content", None)
+            if response_content is None and outbound is not None:
+                response_content = getattr(outbound, "content", "")
+            response_metadata = getattr(outbound, "metadata", {}) if outbound else {}
+            if response_content is None:
+                response_content = ""
             if not renderer.streamed:
                 await renderer.close()
                 _print_agent_response(
-                    response.content if response else "",
+                    response_content,
                     render_markdown=markdown,
-                    metadata=response.metadata if response else None,
+                    metadata=response_metadata,
                 )
             await agent_loop.close_mcp()
 
@@ -1175,7 +1337,8 @@ def agent(
                                     pass
                             continue
                         if msg.metadata.get("_streamed"):
-                            turn_done.set()
+                            if msg.metadata.get("_cli_turn_complete"):
+                                turn_done.set()
                             continue
 
                         if msg.metadata.get("_progress"):
@@ -1187,7 +1350,7 @@ def agent(
                                 await _print_interactive_progress_line(msg.content, _thinking)
                             continue
 
-                        if not turn_done.is_set():
+                        if msg.metadata.get("_cli_turn_complete"):
                             if msg.content:
                                 turn_response.append((msg.content, dict(msg.metadata or {})))
                             turn_done.set()
@@ -1228,7 +1391,11 @@ def agent(
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
-                            metadata={"_wants_stream": True},
+                            # Interactive PowerShell output is rendered once at turn
+                            # completion. Rich Live cursor redraws are not reliable in
+                            # the legacy Windows console host, and a MessageTool send
+                            # may occur before the agent turn has actually completed.
+                            metadata={"_wants_stream": False},
                         ))
 
                         await turn_done.wait()

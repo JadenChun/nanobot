@@ -5,7 +5,6 @@
       "model": "anthropic/claude-opus-4-5",
       "provider": "auto",
       "timezone": "Asia/Kuala_Lumpur",
-      "planningMode": "agent",
       "maxTokens": {
         "input": 120000,
         "output": 4096
@@ -14,9 +13,20 @@
         {
           "path": "/opt/marketing-agent/client-marketing-assistance",
           "readOnly": false,
-          "autoSync": false
+          "autoSync": true
         }
       ]
+    },
+    "crawler": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "google/gemini-2.5-flash-lite",
+      "maxTokens": {
+        "input": 20000,
+        "output": 2000
+      },
+      "maxToolIterations": 20,
+      "reasoningEffort": "low"
     }
   },
   "channels": {

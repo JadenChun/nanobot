@@ -1,12 +1,12 @@
-from unittest.mock import AsyncMock, MagicMock
-
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
 import nanobot.agent.memory as memory_module
+from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import MaxTokensConfig
 from nanobot.providers.base import LLMResponse
 
 
@@ -33,8 +33,14 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
         workspace=tmp_path,
         model="test-model",
         context_window_tokens=context_window_tokens,
+        max_tokens=MaxTokensConfig(input=context_window_tokens, output=0),
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
+    # The production default has a 1024-token drift buffer.  These tests use a
+    # deterministic provider counter and deliberately exercise the exact
+    # configured total context, so remove that separate fixture headroom too.
+    assert loop.budget_manager is not None
+    loop.budget_manager.budget.safety_buffer = 0
     loop.memory_consolidator._SAFETY_BUFFER = 0
     loop.memory_consolidator.max_completion_tokens = 0
     return loop
@@ -52,7 +58,7 @@ async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypatch) -> None:
-    loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
+    loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=2000)
     loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
@@ -174,7 +180,7 @@ async def test_consolidation_runs_after_llm_call(tmp_path, monkeypatch) -> None:
     """
     order: list[str] = []
 
-    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=4000)
 
     async def track_consolidate(messages):
         order.append("consolidate")
@@ -199,7 +205,7 @@ async def test_consolidation_runs_after_llm_call(tmp_path, monkeypatch) -> None:
     call_count = [0]
     def mock_estimate(_session):
         call_count[0] += 1
-        return (1000 if call_count[0] <= 1 else 80, "test")
+        return (3000 if call_count[0] <= 1 else 80, "test")
     loop.memory_consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
 
     await loop.process_direct("hello", session_key="cli:test")

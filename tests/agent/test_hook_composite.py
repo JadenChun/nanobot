@@ -144,7 +144,7 @@ async def test_composite_error_isolation_all_async():
 
 
 # ---------------------------------------------------------------------------
-# finalize_content: pipeline semantics (no error isolation)
+# finalize_content: pipeline semantics with error isolation
 # ---------------------------------------------------------------------------
 
 
@@ -187,6 +187,33 @@ def test_composite_finalize_content_ordering():
     assert steps == ["H1:hi", "H2:HI"]
 
 
+def test_composite_finalize_content_isolates_failures_and_continues(monkeypatch):
+    """A failed transform keeps the last content and does not block later hooks."""
+    calls: list[str] = []
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "nanobot.agent.hook.logger.error",
+        lambda *args, **kwargs: logged.append(args),
+    )
+
+    class Bad(AgentHook):
+        def finalize_content(self, context, content):
+            calls.append(f"bad:{content}")
+            raise RuntimeError(f"failed while handling {content}")
+
+    class Good(AgentHook):
+        def finalize_content(self, context, content):
+            calls.append(f"good:{content}")
+            return f"{content}!"
+
+    content = "sensitive output"
+    result = CompositeHook([Bad(), Good()]).finalize_content(_ctx(), content)
+
+    assert result == f"{content}!"
+    assert calls == [f"bad:{content}", f"good:{content}"]
+    assert all(content not in repr(args) for args in logged)
+
+
 # ---------------------------------------------------------------------------
 # wants_streaming: any-semantics
 # ---------------------------------------------------------------------------
@@ -213,6 +240,30 @@ def test_composite_wants_streaming_all_false():
 def test_composite_wants_streaming_empty():
     hook = CompositeHook([])
     assert hook.wants_streaming() is False
+
+
+def test_composite_wants_streaming_isolates_failures_and_continues(monkeypatch):
+    """A failed query is false, but later hooks still decide the any-result."""
+    calls: list[str] = []
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "nanobot.agent.hook.logger.error",
+        lambda *args, **kwargs: logged.append(args),
+    )
+
+    class Bad(AgentHook):
+        def wants_streaming(self):
+            calls.append("bad")
+            raise RuntimeError("streaming preference failed")
+
+    class Good(AgentHook):
+        def wants_streaming(self):
+            calls.append("good")
+            return True
+
+    assert CompositeHook([Bad(), Good()]).wants_streaming() is True
+    assert calls == ["bad", "good"]
+    assert all("streaming preference failed" not in repr(args) for args in logged)
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +299,8 @@ def _make_loop(tmp_path, hooks=None):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr, \
+         patch("nanobot.agent.loop.ForegroundAgentManager"), \
          patch("nanobot.agent.loop.MemoryConsolidator"):
-        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(
             bus=bus, provider=provider, workspace=tmp_path, hooks=hooks,
         )

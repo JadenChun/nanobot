@@ -24,58 +24,37 @@
 
 This fork extends the original [HKUDS/nanobot](https://github.com/HKUDS/nanobot) with a redesigned agent execution harness, inspired by Anthropic's engineering article on [harness design for long-running agent applications](https://www.anthropic.com/engineering/harness-design-long-running-apps).
 
-### Plan → Act → Verify harness
+### Adaptive orchestrator harness
 
-The original nanobot ran every request through a single flat agent loop — one pass, tools called inline, response returned. This fork replaces that with a three-phase harness:
+The main agent now owns the task from request to final response. It handles straightforward work directly and can choose a bounded foreground role only when that role adds value. There is no mandatory planner → worker → verifier sequence and no background subagent runtime.
 
 ```mermaid
 flowchart TD
-    IN([Inbound message]) --> SIMPLE{Simple\nconversation?}
-    SIMPLE -- yes --> ACT
-    SIMPLE -- no --> PLAN_GATE{planning_mode}
-
-    PLAN_GATE -- off --> ACT
-    PLAN_GATE -- agent/on --> PLAN
-
-    subgraph PLAN ["🔍 Plan phase (read-only)"]
-        P1[Planner LLM\nread-only tools] -->|needs broad\ninvestigation| EXP["Explore subagents\n(parallel, isolated)"]
-        EXP --> P1
-        P1 --> PD{Decision}
-        PD -- answer / clarify --> DIRECT([Return response\ndirectly])
-        PD -- execute --> HO["Structured handoff\naction_summary · review_goal · references"]
-    end
-
-    HO --> ACT
-
-    subgraph ACT ["⚡ Act phase (full tools)"]
-        A1[Action agent\nfull tool set] -->|tool calls| A1
-        A1 --> AR[Response]
-    end
-
-    AR --> VERIFY_GATE{Should\nverify?}
-    VERIFY_GATE -- no --> OUT([Return to user])
-
-    subgraph VERIFY ["✅ Verify phase (read-only)"]
-        V1[Verifier LLM\nread-only tools] --> VD{Verdict}
-        VD -- pass --> OUT
-        VD -- fail --> REV[Revision prompt\ninjected into Act]
-        REV --> ACT
-    end
-
-    VERIFY_GATE -- yes --> VERIFY
+    IN([Inbound message]) --> ORCH[Main orchestrator]
+    ORCH -->|straightforward task| DIRECT[Use normal tools directly]
+    ORCH -->|sequencing is genuinely useful| PLAN[Foreground planner]
+    ORCH -->|bounded implementation package| WORK[Foreground worker]
+    ORCH -->|broad read-only investigation| EXPLORE[Foreground explorer]
+    ORCH -->|rendered public-page research| CRAWL[Foreground Crawl4AI worker]
+    ORCH -->|important or uncertain result| REVIEW[Foreground reviewer]
+    PLAN --> ORCH
+    WORK --> ORCH
+    EXPLORE --> ORCH
+    CRAWL --> ORCH
+    REVIEW --> ORCH
+    DIRECT --> ORCH
+    ORCH --> OUT([Natural user-facing response])
 ```
 
-| Phase | What happens |
+| Route | What happens |
 |---|---|
-| **Plan** | A read-only internal planner inspects the task, gathers evidence using file reads, web search, or foreground explore subagents, then produces a structured handoff: `action_summary`, `review_goal`, and referenced findings. |
-| **Act** | The action agent runs with the full tool set, guided by the planner's handoff. It executes the task and produces a response. |
-| **Verify** | An internal verifier re-reads the output against the planner's `review_goal`. If it fails, a revision round runs automatically before the final response is returned. |
+| **Direct** | The orchestrator uses the normal tool set and completes the task itself. |
+| **Plan / Explore** | A read-only foreground role returns evidence or an execution-ready plan. |
+| **Delegate** | One scoped foreground worker handles a bounded contract and cannot write outside its declared paths. |
+| **Crawl** | A separately configured foreground model controls the deterministic Crawl4AI worker for public-page research. |
+| **Review** | A read-only foreground reviewer checks a specific deliverable when the orchestrator decides review is warranted. |
 
-The planner only activates when useful (`planning_mode = "agent"` by default — the LLM decides). Simple conversational turns skip straight to Act.
-
-### Foreground explore subagents
-
-The planner can delegate broad read-only investigation to foreground **explore subagents** via an `explore` tool. Each subagent runs its own isolated agent loop with read-only tools, reports structured findings (summary, file references, open questions), and exits — keeping the planner context clean. Up to 2 explore agents can run in parallel per planner turn (configurable).
+All role calls are synchronous from the orchestrator's perspective: it waits for the result, evaluates it, and decides the next step. Role output is internal evidence; the user receives a concise, natural summary rather than harness state or transcripts.
 
 ### Smart tool-result compaction
 
@@ -1358,7 +1337,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `taskUpdateMode` | `"verbose"` | Channel reply style: `result`, `plan_result`, or `verbose` |
+| `taskUpdateMode` | `"verbose"` | Channel reply style: `result` or `verbose` |
 | `sendToolHints` | `false` | Stream tool-call hints (e.g. `read_file("…")`) |
 | `sendMaxRetries` | `3` | Max delivery attempts per outbound message, including the initial send (0-10 configured, minimum 1 actual attempt) |
 
@@ -1972,10 +1951,10 @@ nanobot/
 ├── agent/          # 🧠 Core agent logic
 │   ├── loop.py     #    Agent loop (LLM ↔ tool execution)
 │   ├── context.py  #    Prompt builder
+│   ├── delegation.py #  Optional foreground roles
 │   ├── memory.py   #    Persistent memory
 │   ├── skills.py   #    Skills loader
-│   ├── subagent.py #    Background task execution
-│   └── tools/      #    Built-in tools (incl. spawn)
+│   └── tools/      #    Built-in and foreground-routing tools
 ├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
 ├── channels/       # 📱 Chat channel integrations (supports plugins)
 ├── bus/            # 🚌 Message routing

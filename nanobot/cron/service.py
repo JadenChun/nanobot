@@ -2,8 +2,11 @@
 
 import asyncio
 import json
+import os
+import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -19,10 +22,52 @@ from nanobot.cron.types import (
     CronSchedule,
     CronStore,
 )
+from nanobot.utils.prompt_budget import portable_file_lock
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _execution_field(execution: Any, *names: str) -> Any:
+    """Read a compatibility field from a cron callback result."""
+    if isinstance(execution, Mapping):
+        for name in names:
+            if name in execution and execution[name] is not None:
+                return execution[name]
+        return None
+    for name in names:
+        value = getattr(execution, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _execution_run_id(execution: Any) -> str | None:
+    """Extract an optional canonical turn ID without changing callback APIs."""
+    value = _execution_field(execution, "run_id", "runId")
+    return str(value) if value else None
+
+
+def _execution_status(execution: Any) -> str:
+    """Normalize a canonical turn result to a stable lifecycle value."""
+    status = _execution_field(execution, "status", "run_status", "runStatus")
+    status = getattr(status, "value", status)
+    if status is None:
+        status = _execution_field(execution, "stop_reason", "stopReason")
+    status = getattr(status, "value", status)
+    return str(status or "completed").lower()
+
+
+def _execution_error(execution: Any) -> str | None:
+    """Normalize a canonical result's terminal failure, if any."""
+    error = _execution_field(execution, "error")
+    if error:
+        return str(error)
+    status = _execution_status(execution)
+    if status in {"error", "tool_error", "policy_blocked", "cancelled", "max_iterations"}:
+        return f"cron execution stopped with {status}"
+    return None
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
@@ -76,9 +121,10 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        on_job: Callable[[CronJob], Coroutine[Any, Any, Any]] | None = None,
     ):
         self.store_path = store_path
+        self.lock_path = Path(f"{store_path}.lock")
         self.on_job = on_job
         self._store: CronStore | None = None
         self._last_mtime: float = 0.0
@@ -130,13 +176,14 @@ class CronService:
                                 and destination.get("channel")
                                 and destination.get("to")
                             ],
-                            planning_mode=j["payload"].get("planning_mode"),
-                            skip_verification=j["payload"].get("skip_verification", False),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
+                            last_run_status=j.get("state", {}).get(
+                                "lastRunStatus", j.get("state", {}).get("runStatus")
+                            ),
                             last_error=j.get("state", {}).get("lastError"),
                             run_history=[
                                 CronRunRecord(
@@ -144,6 +191,11 @@ class CronService:
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
+                                    run_id=r.get("runId", r.get("run_id")),
+                                    run_status=r.get("runStatus", r.get("run_status")),
+                                    occurrence_id=r.get(
+                                        "occurrenceId", r.get("occurrence_id")
+                                    ),
                                 )
                                 for r in j.get("state", {}).get("runHistory", [])
                             ],
@@ -152,6 +204,20 @@ class CronService:
                         updated_at_ms=j.get("updatedAtMs", 0),
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
+                for job in jobs:
+                    # Older stores and interrupted writers may contain the
+                    # same occurrence more than once.  Keep the latest copy
+                    # by stable occurrence ID while preserving legacy records
+                    # that have no identifier.
+                    deduped: list[CronRunRecord] = []
+                    seen_occurrences: set[str] = set()
+                    for record in reversed(job.state.run_history):
+                        if record.occurrence_id and record.occurrence_id in seen_occurrences:
+                            continue
+                        if record.occurrence_id:
+                            seen_occurrences.add(record.occurrence_id)
+                        deduped.append(record)
+                    job.state.run_history = list(reversed(deduped))[-self._MAX_RUN_HISTORY:]
                 self._store = CronStore(jobs=jobs)
             except Exception as e:
                 logger.warning("Failed to load cron store: {}", e)
@@ -161,8 +227,21 @@ class CronService:
 
         return self._store
 
-    def _save_store(self) -> None:
-        """Save jobs to disk."""
+    def _load_store_locked(self) -> CronStore:
+        """Reload jobs from disk while the caller holds ``lock_path``."""
+        self._store = None
+        return self._load_store()
+
+    def _save_store(self, *, _lock_held: bool = False) -> None:
+        """Save jobs to disk, locking before serializing when needed."""
+        if not _lock_held:
+            with portable_file_lock(self.lock_path):
+                self._save_store_locked()
+            return
+        self._save_store_locked()
+
+    def _save_store_locked(self) -> None:
+        """Serialize and atomically save jobs while ``lock_path`` is held."""
         if not self._store:
             return
 
@@ -192,13 +271,12 @@ class CronService:
                             {"channel": destination.channel, "to": destination.to}
                             for destination in j.payload.additional_destinations
                         ],
-                        "planning_mode": j.payload.planning_mode,
-                        "skip_verification": j.payload.skip_verification,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
                         "lastRunAtMs": j.state.last_run_at_ms,
                         "lastStatus": j.state.last_status,
+                        "lastRunStatus": j.state.last_run_status,
                         "lastError": j.state.last_error,
                         "runHistory": [
                             {
@@ -206,6 +284,9 @@ class CronService:
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
+                                **({"runId": r.run_id} if r.run_id is not None else {}),
+                                **({"runStatus": r.run_status} if r.run_status is not None else {}),
+                                **({"occurrenceId": r.occurrence_id} if r.occurrence_id is not None else {}),
                             }
                             for r in j.state.run_history
                         ],
@@ -218,15 +299,37 @@ class CronService:
             ]
         }
 
-        self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.store_path.name}.",
+            suffix=".tmp",
+            dir=self.store_path.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.store_path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
         self._last_mtime = self.store_path.stat().st_mtime
 
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
-        self._load_store()
-        self._recompute_next_runs()
-        self._save_store()
+        # Startup is one short locked read-modify-write.  Job execution is
+        # never performed under this lock; only reload, schedule recompute,
+        # and the atomic persistence belong to the transaction.
+        with portable_file_lock(self.lock_path):
+            self._load_store_locked()
+            self._recompute_next_runs()
+            self._save_store(_lock_held=True)
         self._arm_timer()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
 
@@ -288,36 +391,118 @@ class CronService:
         for job in due_jobs:
             await self._execute_job(job)
 
-        self._save_store()
         self._arm_timer()
+
+    def _persist_execution_state(self, job: CronJob, occurrence_id: str) -> None:
+        """Merge one completed occurrence into the latest jobs.json.
+
+        The LLM callback runs outside the store lock.  At completion, reload
+        the file and patch only this job's runtime occurrence state, so a CLI
+        disable/add/remove made during execution remains authoritative.
+        """
+        with portable_file_lock(self.lock_path):
+            latest = CronService(self.store_path)._load_store()
+            current = next((item for item in latest.jobs if item.id == job.id), None)
+            if current is None:
+                self._store = latest
+                return
+
+            existing = {
+                record.occurrence_id
+                for record in current.state.run_history
+                if record.occurrence_id
+            }
+            if occurrence_id not in existing:
+                current.state.last_run_at_ms = job.state.last_run_at_ms
+                current.state.last_status = job.state.last_status
+                current.state.last_run_status = job.state.last_run_status
+                current.state.last_error = job.state.last_error
+                current.state.run_history.extend(
+                    record
+                    for record in job.state.run_history
+                    if record.occurrence_id == occurrence_id
+                )
+                current.state.run_history = current.state.run_history[-self._MAX_RUN_HISTORY:]
+                current.updated_at_ms = max(current.updated_at_ms, job.updated_at_ms)
+
+            # Recompute only runtime scheduling state from the latest schedule
+            # and enabled flag.  Never copy stale payload/schedule/enabled data
+            # from the object that was executing while the CLI was mutating.
+            if current.enabled:
+                current.state.next_run_at_ms = _compute_next_run(
+                    current.schedule, _now_ms()
+                )
+            else:
+                current.state.next_run_at_ms = None
+
+            if current.schedule.kind == "at" and current.delete_after_run and current.enabled:
+                latest.jobs = [item for item in latest.jobs if item.id != current.id]
+
+            self._store = latest
+            self._save_store(_lock_held=True)
 
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
         start_ms = _now_ms()
+        occurrence_id = str(start_ms)
+        if any(record.occurrence_id == occurrence_id for record in job.state.run_history):
+            # Millisecond clocks can repeat during a tight manual-run loop;
+            # retain the start timestamp as the stable prefix while keeping
+            # each actual occurrence independently deduplicable.
+            occurrence_id = f"{occurrence_id}-{uuid.uuid4().hex[:8]}"
+        job._occurrence_id = occurrence_id  # type: ignore[attr-defined]
+        # Make the occurrence visible to the callback so scheduled links use
+        # the actual execution start rather than a previous run's timestamp.
+        job.state.last_run_at_ms = start_ms
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
+        execution_run_id: str | None = None
+        execution_status = "completed"
 
         try:
             if self.on_job:
-                await self.on_job(job)
+                execution = await self.on_job(job)
+                execution_run_id = _execution_run_id(execution)
+                execution_status = _execution_status(execution)
+                execution_error = _execution_error(execution)
+                # Structured canonical terminal statuses are recorded as-is;
+                # only an otherwise-successful legacy callback that exposes
+                # an error should take the exception path.
+                if execution_error is not None and execution_status == "completed":
+                    raise RuntimeError(execution_error)
 
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info("Cron: job '{}' completed", job.name)
+            if execution_status == "approval_required":
+                job.state.last_status = "skipped"
+                job.state.last_error = "approval required"
+                logger.info("Cron: job '{}' requires approval", job.name)
+            elif execution_status == "completed":
+                job.state.last_status = "ok"
+                job.state.last_error = None
+                logger.info("Cron: job '{}' completed", job.name)
+            else:
+                job.state.last_status = "error"
+                job.state.last_error = _execution_error(execution) if self.on_job else (
+                    f"cron execution stopped with {execution_status}"
+                )
+                logger.error("Cron: job '{}' stopped with {}", job.name, execution_status)
 
         except Exception as e:
+            execution_status = "error"
             job.state.last_status = "error"
             job.state.last_error = str(e)
             logger.error("Cron: job '{}' failed: {}", job.name, e)
 
         end_ms = _now_ms()
-        job.state.last_run_at_ms = start_ms
         job.updated_at_ms = end_ms
+        job.state.last_run_status = execution_status
 
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
+            run_id=execution_run_id,
+            run_status=execution_status,
+            occurrence_id=occurrence_id,
         ))
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
@@ -331,6 +516,8 @@ class CronService:
         else:
             # Compute next run
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+        self._persist_execution_state(job, occurrence_id)
 
     # ========== Public API ==========
 
@@ -349,12 +536,9 @@ class CronService:
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
-        planning_mode: str | None = None,
-        skip_verification: bool = False,
         additional_destinations: list[CronDestination] | None = None,
     ) -> CronJob:
         """Add a new job."""
-        store = self._load_store()
         _validate_schedule_for_add(schedule)
         now = _now_ms()
 
@@ -370,8 +554,6 @@ class CronService:
                 channel=channel,
                 to=to,
                 additional_destinations=list(additional_destinations or []),
-                planning_mode=planning_mode,
-                skip_verification=skip_verification,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -379,8 +561,11 @@ class CronService:
             delete_after_run=delete_after_run,
         )
 
-        store.jobs.append(job)
-        self._save_store()
+        with portable_file_lock(self.lock_path):
+            store = CronService(self.store_path)._load_store()
+            store.jobs.append(job)
+            self._store = store
+            self._save_store(_lock_held=True)
         self._arm_timer()
 
         logger.info("Cron: added job '{}' ({})", name, job.id)
@@ -388,13 +573,17 @@ class CronService:
 
     def remove_job(self, job_id: str) -> bool:
         """Remove a job by ID."""
-        store = self._load_store()
-        before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id]
-        removed = len(store.jobs) < before
+        with portable_file_lock(self.lock_path):
+            store = CronService(self.store_path)._load_store()
+            before = len(store.jobs)
+            store.jobs = [j for j in store.jobs if j.id != job_id]
+            removed = len(store.jobs) < before
+
+            if removed:
+                self._store = store
+                self._save_store(_lock_held=True)
 
         if removed:
-            self._save_store()
             self._arm_timer()
             logger.info("Cron: removed job {}", job_id)
 
@@ -402,18 +591,20 @@ class CronService:
 
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
         """Enable or disable a job."""
-        store = self._load_store()
-        for job in store.jobs:
-            if job.id == job_id:
-                job.enabled = enabled
-                job.updated_at_ms = _now_ms()
-                if enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-                else:
-                    job.state.next_run_at_ms = None
-                self._save_store()
-                self._arm_timer()
-                return job
+        with portable_file_lock(self.lock_path):
+            store = CronService(self.store_path)._load_store()
+            for job in store.jobs:
+                if job.id == job_id:
+                    job.enabled = enabled
+                    job.updated_at_ms = _now_ms()
+                    if enabled:
+                        job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                    else:
+                        job.state.next_run_at_ms = None
+                    self._store = store
+                    self._save_store(_lock_held=True)
+                    self._arm_timer()
+                    return job
         return None
 
     async def run_job(self, job_id: str, force: bool = False) -> bool:
@@ -424,7 +615,6 @@ class CronService:
                 if not force and not job.enabled:
                     return False
                 await self._execute_job(job)
-                self._save_store()
                 self._arm_timer()
                 return True
         return False
