@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -8,8 +9,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.tools.social_crawl import SocialCrawlClient, SocialCrawlTool
+from nanobot.agent.tools.social_crawl import (
+    SocialCrawlClient,
+    SocialCrawlError,
+    SocialCrawlTool,
+    classify_crawler_action,
+)
 from nanobot.crawler.worker import BrowserSession, Crawl4AIWorker, WorkerRequestError
+
+
+def test_browser_actions_are_machine_classified() -> None:
+    assert classify_crawler_action("open") == "read_navigation"
+    assert classify_crawler_action("navigate") == "read_navigation"
+    assert classify_crawler_action("follow_link") == "read_navigation"
+    assert classify_crawler_action("expand") == "read_navigation"
+    assert classify_crawler_action("paginate") == "read_navigation"
+    assert classify_crawler_action("click") == "state_changing"
+    assert classify_crawler_action("unknown") == "state_changing"
 
 
 def _result(
@@ -229,8 +245,33 @@ def test_social_crawl_client_can_use_loopback_tcp() -> None:
     assert response == {"ok": True, "status": "ready"}
 
 
+def test_social_crawl_client_rejects_raw_click_before_socket_connect(monkeypatch) -> None:
+    connect = MagicMock(side_effect=AssertionError("socket must not be opened"))
+    monkeypatch.setattr(socket, "socket", connect)
+
+    with pytest.raises(SocialCrawlError, match="click"):
+        SocialCrawlClient(socket_path="worker.sock").request(
+            "click",
+            selector="button.like",
+        )
+
+
 @pytest.mark.asyncio
-async def test_click_action_is_built_server_side_and_returns_rendered_html() -> None:
+async def test_social_crawl_client_async_rejects_raw_click_before_socket_connect(monkeypatch) -> None:
+    connect = AsyncMock(side_effect=AssertionError("socket must not be opened"))
+    monkeypatch.setattr(asyncio, "open_unix_connection", connect)
+
+    with pytest.raises(SocialCrawlError, match="click"):
+        await SocialCrawlClient(socket_path="worker.sock").request_async(
+            "click",
+            selector="button.like",
+        )
+
+    connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_click_action_is_rejected_at_worker_dispatch_before_browser_use() -> None:
     worker = Crawl4AIWorker("worker.sock", {"threads.net"})
     worker.sessions["session-1"] = BrowserSession(
         url="https://www.threads.net/t/example", updated_at=0
@@ -238,27 +279,19 @@ async def test_click_action_is_built_server_side_and_returns_rendered_html() -> 
     worker._expire_sessions = AsyncMock()
     worker._browser_context_alive = MagicMock(return_value=True)
     worker._validate_public_dns = AsyncMock()
-    worker._crawl_result = AsyncMock(
-        return_value=_result(
-            '<div role="article"><p>Rendered reply</p></div>',
-            "https://www.threads.net/t/example",
+    worker._crawl_result = AsyncMock()
+
+    with pytest.raises(WorkerRequestError, match="click"):
+        await worker.dispatch(
+            {
+                "op": "click",
+                "session_id": "session-1",
+                "selector": "button[aria-label=Replies]",
+                "wait_ms": 250,
+            }
         )
-    )
 
-    response = await worker.dispatch(
-        {
-            "op": "click",
-            "session_id": "session-1",
-            "selector": "button[aria-label=Replies]",
-            "wait_ms": 250,
-        }
-    )
-
-    assert response["html"] == '<div role="article"><p>Rendered reply</p></div>'
-    call = worker._crawl_result.await_args.kwargs
-    assert call["js_only"] is True
-    assert "document.querySelector" in call["js_code"]
-    assert "button[aria-label=Replies]" in call["js_code"]
+    worker._crawl_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -294,6 +327,35 @@ async def test_navigate_reuses_the_existing_browser_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_follow_link_uses_server_validated_navigation_primitive() -> None:
+    worker = Crawl4AIWorker("worker.sock", {"facebook.com"})
+    worker.sessions["session-1"] = BrowserSession(
+        url="https://www.facebook.com/example", updated_at=0
+    )
+    worker._expire_sessions = AsyncMock()
+    worker._browser_context_alive = MagicMock(return_value=True)
+    worker._validate_public_dns = AsyncMock()
+    worker._crawl_result = AsyncMock(side_effect=[
+        _result(
+            "",
+            "https://www.facebook.com/example",
+            js_execution_result={"results": ["https://www.facebook.com/next"]},
+        ),
+        _result("<main>next page</main>", "https://www.facebook.com/next"),
+    ])
+
+    response = await worker.dispatch({
+        "op": "follow_link",
+        "session_id": "session-1",
+        "selector": "a.next",
+    })
+
+    assert response["action_class"] == "read_navigation"
+    assert response["url"] == "https://www.facebook.com/next"
+    assert worker._crawl_result.await_args_list[1].kwargs["url"] == "https://www.facebook.com/next"
+
+
+@pytest.mark.asyncio
 async def test_authenticated_profile_disables_click_actions(tmp_path) -> None:
     worker = Crawl4AIWorker(
         "worker.sock",
@@ -306,7 +368,7 @@ async def test_authenticated_profile_disables_click_actions(tmp_path) -> None:
     worker._expire_sessions = AsyncMock()
     worker._browser_context_alive = MagicMock(return_value=True)
 
-    with pytest.raises(WorkerRequestError, match="click is disabled"):
+    with pytest.raises(WorkerRequestError, match="click"):
         await worker.dispatch(
             {
                 "op": "click",
@@ -575,6 +637,33 @@ async def test_social_crawl_cleanup_resets_orphaned_worker_session(monkeypatch) 
     await tool.cleanup()
 
     assert [call.args for call in request.await_args_list] == [("reset",), ("reset",)]
+
+
+@pytest.mark.asyncio
+async def test_social_crawl_cleanup_waits_for_reset_before_reraising_cancel(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reset(op: str, **_params):
+        assert op == "reset"
+        started.set()
+        await release.wait()
+        return {"ok": True, "reset_sessions": 1}
+
+    request = AsyncMock(side_effect=reset)
+    monkeypatch.setattr(SocialCrawlClient, "request_async", request)
+    tool = SocialCrawlTool()
+    tool._active_session_id = "s1"
+
+    task = asyncio.create_task(tool.cleanup())
+    await started.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert request.await_count == 1
+    assert tool._active_session_id is None
 
 
 @pytest.mark.asyncio

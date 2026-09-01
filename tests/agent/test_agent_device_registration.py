@@ -31,13 +31,14 @@ def test_loop_skips_agent_device_when_disabled(tmp_path) -> None:
     assert loop.tools.get("agent_device") is None
 
 
-def test_foreground_read_only_role_includes_device_without_write_tools(tmp_path) -> None:
+def test_foreground_role_profiles_scope_device_without_write_tools(tmp_path) -> None:
     manager = ForegroundAgentManager(provider=_provider(), workspace=tmp_path)
-    tools = manager._read_only_tools()
+    tools = manager._tools_for_role("explorer")
 
     assert tools.get("agent_device") is not None
     assert tools.get("write_file") is None
     assert tools.get("edit_file") is None
+    assert manager._tools_for_role("planner").get("agent_device") is None
 
 
 def test_foreground_worker_has_scoped_write_tools(tmp_path) -> None:

@@ -1,7 +1,12 @@
 """Base class for agent tools."""
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any
+
+from nanobot.agent.turn import ToolOutcome
+
+__all__ = ["Tool", "ToolOutcome"]
 
 
 class Tool(ABC):
@@ -70,6 +75,27 @@ class Tool(ABC):
             Result of the tool execution (string or list of content blocks).
         """
         pass
+
+    async def execute_with_context(self, context: Any, **kwargs: Any) -> Any:
+        """Execute with an explicit turn context when the tool opts in.
+
+        The legacy ``execute(**kwargs)`` contract remains unchanged.  A tool
+        that needs per-turn state may either override this method or declare a
+        ``context``/``execution_context`` parameter on ``execute``.  We do not
+        inject context into arbitrary ``**kwargs`` methods because several
+        existing adapters forward unknown kwargs to remote tools.
+        """
+        execute = self.execute
+        try:
+            parameters = inspect.signature(execute).parameters
+        except (TypeError, ValueError):
+            return await execute(**kwargs)
+
+        if "context" in parameters:
+            kwargs["context"] = context
+        elif "execution_context" in parameters:
+            kwargs["execution_context"] = context
+        return await execute(**kwargs)
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""

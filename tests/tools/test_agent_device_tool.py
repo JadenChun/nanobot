@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from nanobot.agent.tools.agent_device import AgentDeviceTool
+from nanobot.agent.tools.agent_device import AgentDeviceTool, classify_device_action
+from nanobot.agent.turn import RunStatus, ToolOutcome
 
 
 class _FakeProcess:
@@ -56,4 +58,56 @@ async def test_agent_device_returns_json_payload_for_success() -> None:
     assert payload["exitCode"] == 0
     assert payload["stdout"] == "booted\n"
     assert payload["stderr"] == ""
+    assert payload["action_class"] == "read_navigation"
     mock_exec.assert_called_once()
+
+
+def test_agent_device_classifies_inspection_and_interaction() -> None:
+    assert classify_device_action(["devices", "--platform", "ios"]) == "read_navigation"
+    assert classify_device_action(["snapshot", "-i"]) == "read_navigation"
+    assert classify_device_action(["press", "@e2"]) == "state_changing"
+    assert classify_device_action(["unknown-command"]) == "state_changing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args, working_dir",
+    [
+        (["screenshot", "/tmp/screen.png"], None),
+        (["screenshot", "--output", "/tmp/screen.png"], None),
+        (["snapshot", "-i"], "/tmp/caller-selected"),
+    ],
+)
+async def test_agent_device_read_only_rejects_screenshot_output_and_caller_cwd(
+    args: list[str], working_dir: str | None, monkeypatch
+) -> None:
+    process = AsyncMock()
+    monkeypatch.setattr("nanobot.agent.tools.agent_device.run_owned_process", process)
+
+    result = await AgentDeviceTool(
+        read_only=True,
+        working_dir="/tmp/configured",
+    ).execute(args=args, working_dir=working_dir)
+
+    assert isinstance(result, ToolOutcome)
+    assert result.stop_reason == RunStatus.POLICY_BLOCKED.value
+    process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_device_read_only_allows_snapshot_without_override(monkeypatch) -> None:
+    process = AsyncMock(return_value=SimpleNamespace(
+        timed_out=False,
+        stdout=b"ok\n",
+        stderr=b"",
+        returncode=0,
+    ))
+    monkeypatch.setattr("nanobot.agent.tools.agent_device._resolve_npx", lambda: "npx")
+    monkeypatch.setattr("nanobot.agent.tools.agent_device.run_owned_process", process)
+
+    result = await AgentDeviceTool(read_only=True, working_dir="/tmp/configured").execute(
+        args=["snapshot"],
+    )
+
+    assert json.loads(result)["action_class"] == "read_navigation"
+    process.assert_awaited_once()

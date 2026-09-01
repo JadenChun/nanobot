@@ -7,8 +7,10 @@ import json
 import os
 import re
 import time
+import warnings
 from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -16,10 +18,15 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.context_budget import ContextBudget, ContextBudgetManager
-from nanobot.agent.delegation import ForegroundAgentManager
+from nanobot.agent.delegation import (
+    ForegroundAgentManager,
+    reset_current_turn_context,
+    set_current_turn_context,
+)
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.policy import RiskyActionPolicy
+from nanobot.agent.run_store import RunStore
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
@@ -46,6 +53,22 @@ from nanobot.agent.tools.trend_vpn import (
     vpn_tools_enabled,
 )
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.turn import (
+    ApprovalGrant,
+    DeliveryState,
+    DeliveryTarget,
+    HistoryMode,
+    RunPolicyContext,
+    RunRecord,
+    RunStatus,
+    SessionRunRef,
+    ToolOutcome,
+    TurnCallbacks,
+    TurnContext,
+    TurnRequest,
+    TurnResult,
+    TurnSource,
+)
 from nanobot.agent.write_guard import FileLockRegistry
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -53,7 +76,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.context_repo import ContextRepoManager, ResourceAccessPolicy
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.helpers import estimate_prompt_tokens_chain
+from nanobot.utils.prompt_budget import PromptBudgetExceeded
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -68,6 +91,21 @@ if TYPE_CHECKING:
         WebSearchConfig,
     )
     from nanobot.cron.service import CronService
+
+
+class _TurnStopError(Exception):
+    """Internal signal used to stop the runner before its next model call."""
+
+    def __init__(
+        self,
+        stop_reason: str,
+        content: Any = None,
+        policy_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(stop_reason)
+        self.stop_reason = stop_reason
+        self.content = content
+        self.policy_metadata = policy_metadata or {}
 
 
 class _LoopHook(AgentHook):
@@ -88,6 +126,7 @@ class _LoopHook(AgentHook):
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
     ) -> None:
         self._loop = agent_loop
         self._on_progress = on_progress
@@ -97,10 +136,22 @@ class _LoopHook(AgentHook):
         self._chat_id = chat_id
         self._message_id = message_id
         self._session_key = session_key
+        self._turn_context = turn_context
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
         return self._on_stream is not None
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if self._turn_context is None:
+            return
+        stop_reason = self._turn_context.metadata.get("_tool_stop_reason")
+        if stop_reason:
+            raise _TurnStopError(
+                str(stop_reason),
+                self._turn_context.metadata.get("_tool_stop_content"),
+                dict(self._turn_context.metadata.get("_tool_policy_metadata") or {}),
+            )
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         self._stream_buf += delta
@@ -128,9 +179,21 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id, self._session_key)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        if self._turn_context is not None:
+            self._turn_context.messages = context.messages
+            if context.tool_calls:
+                self._turn_context.tools_used.extend(
+                    tool_call.name for tool_call in context.tool_calls
+                )
+            if context.tool_results:
+                self._turn_context.tool_results.extend(context.tool_results)
+            self._turn_context.metadata["_turn_usage"] = dict(context.usage)
+            self._turn_context.metadata["_turn_tool_events"] = [
+                *self._turn_context.metadata.get("_turn_tool_events", []),
+                *context.tool_events,
+            ]
         for event in context.tool_events:
             if event.get("status") == "error":
                 logger.error(
@@ -184,6 +247,61 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+class _ContextualToolRegistry:
+    """Registry-shaped adapter binding one runner invocation to one turn.
+
+    ``AgentRunner`` intentionally remains product-agnostic and asks its
+    registry for bare model-facing values.  This adapter invokes the WP1
+    contextual registry API, records any terminal policy envelope on the
+    ``TurnContext``, and unwraps only the JSON-safe content sent back to the
+    model.  No per-turn routing state is written to shared tool instances.
+    """
+
+    def __init__(self, registry: ToolRegistry, context: TurnContext) -> None:
+        self._registry = registry
+        self.context = context
+
+    def get_definitions(self) -> list[dict[str, Any]]:
+        return self._registry.get_definitions()
+
+    def get(self, name: str) -> Any:
+        return self._registry.get(name)
+
+    def iter_tools(self):
+        return self._registry.iter_tools()
+
+    @property
+    def tool_names(self) -> list[str]:
+        return self._registry.tool_names
+
+    async def execute(self, name: str, params: dict[str, Any]) -> Any:
+        outcome = await self._registry.execute(name, params, context=self.context)
+        if isinstance(outcome, ToolOutcome):
+            if outcome.stop_reason in {
+                RunStatus.APPROVAL_REQUIRED.value,
+                RunStatus.POLICY_BLOCKED.value,
+                RunStatus.TOOL_ERROR.value,
+                RunStatus.CANCELLED.value,
+            }:
+                self.context.metadata["_tool_stop_reason"] = outcome.stop_reason
+                self.context.metadata["_tool_stop_content"] = outcome.content
+                self.context.metadata["_tool_policy_metadata"] = dict(outcome.policy_metadata)
+            # Preserve the shared envelope for AgentRunner.  It owns the
+            # product-neutral terminal/skip behavior and must see the first
+            # stop before a later outer tool can start.
+            return outcome
+        return ToolOutcome(content=outcome)
+
+    async def execute_with_context(self, name: str, params: dict[str, Any]) -> ToolOutcome:
+        outcome = await self._registry.execute(name, params, context=self.context)
+        return outcome if isinstance(outcome, ToolOutcome) else ToolOutcome(content=outcome)
+
+
+def target_message_id(target: DeliveryTarget | None) -> str | None:
+    """Return a message identifier from a normalized delivery target."""
+    return target.message_id if target is not None else None
+
+
 @dataclass(slots=True)
 class _PendingApproval:
     """Pending risky action awaiting an explicit yes/no reply."""
@@ -191,6 +309,22 @@ class _PendingApproval:
     summary: str
     created_at: float
     session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovalSnapshot:
+    """Approval state observed atomically before choosing the detail lock."""
+
+    alias_key: str
+    pending: _PendingApproval | None
+    action: str
+    effective_key: str
+
+
+_STALE_APPROVAL_MESSAGE = (
+    "That approval request is no longer current. "
+    "Please reply to the latest approval request."
+)
 
 
 class AgentLoop:
@@ -297,6 +431,7 @@ class AgentLoop:
         )
         self.context_paths = self.context_manager.paths
         self.sessions = session_manager or SessionManager(workspace)
+        self.run_store = RunStore(workspace, session_manager=self.sessions)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
 
@@ -355,6 +490,7 @@ class AgentLoop:
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._pending_approvals: dict[str, _PendingApproval] = {}
+        self._approval_guard = asyncio.Lock()
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -545,28 +681,75 @@ class AgentLoop:
     def _is_negative(text: str) -> bool:
         return bool(re.fullmatch(r"\s*(no|n|cancel|stop|don't|do not)\s*[.!]?\s*", text, re.I))
 
-    def _clear_pending_approval(
+    async def _snapshot_approval(self, key: str, content: str) -> _ApprovalSnapshot:
+        """Snapshot and classify a pending approval without holding session locks."""
+        async with self._approval_guard:
+            pending = self._pending_approvals.get(key)
+            if pending is None:
+                return _ApprovalSnapshot(
+                    alias_key=key,
+                    pending=None,
+                    action="none",
+                    effective_key=key,
+                )
+
+            raw = content.strip()
+            if self._is_affirmative(raw):
+                action = "affirmative"
+                effective_key = pending.session_key
+            elif self._is_negative(raw):
+                action = "negative"
+                effective_key = key
+            elif raw.startswith("/"):
+                # Slash commands are routed independently and must not consume
+                # an approval merely because one is pending in this chat.
+                action = "command"
+                effective_key = key
+            else:
+                action = "other"
+                effective_key = key
+
+            return _ApprovalSnapshot(
+                alias_key=key,
+                pending=pending,
+                action=action,
+                effective_key=effective_key,
+            )
+
+    def _remove_pending_approval_identity_locked(self, pending: _PendingApproval) -> bool:
+        """Remove only aliases whose value is exactly ``pending``.
+
+        Callers must already hold ``_approval_guard``.  Comparing object
+        identity is deliberate: a newer approval may reuse the same detail
+        session key while replacing the visible-chat alias.
+        """
+        removed = False
+        for approval_key, approval in list(self._pending_approvals.items()):
+            if approval is pending:
+                self._pending_approvals.pop(approval_key, None)
+                removed = True
+        return removed
+
+    async def _clear_pending_approval(
         self,
         key: str,
         pending: _PendingApproval | None = None,
-    ) -> None:
-        """Clear a pending approval and any chat alias pointing at it."""
-        pending = pending or self._pending_approvals.get(key)
-        if pending is None:
-            self._pending_approvals.pop(key, None)
-            return
-        for approval_key, approval in list(self._pending_approvals.items()):
-            if approval is pending or approval.session_key == pending.session_key:
-                self._pending_approvals.pop(approval_key, None)
+    ) -> bool:
+        """Clear the current approval alias and all aliases of that object."""
+        async with self._approval_guard:
+            candidate = pending or self._pending_approvals.get(key)
+            if candidate is None or self._pending_approvals.get(key) is not candidate:
+                return False
+            return self._remove_pending_approval_identity_locked(candidate)
 
-    def _store_pending_approval(
+    def _store_pending_approval_locked(
         self,
         *,
         session_key: str,
         channel: str,
         chat_id: str,
         summary: str,
-    ) -> None:
+    ) -> _PendingApproval:
         """Store approval by task session and by the user-visible chat."""
         pending = _PendingApproval(
             summary=summary,
@@ -577,6 +760,24 @@ class AgentLoop:
         visible_key = f"{channel}:{chat_id}"
         if visible_key != session_key:
             self._pending_approvals[visible_key] = pending
+        return pending
+
+    async def _store_pending_approval(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        summary: str,
+    ) -> _PendingApproval:
+        """Store an approval under the short-lived approval-map guard."""
+        async with self._approval_guard:
+            return self._store_pending_approval_locked(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                summary=summary,
+            )
 
     @staticmethod
     def _should_mirror_task_session(session_key: str, visible_key: str) -> bool:
@@ -594,26 +795,35 @@ class AgentLoop:
         task_text: str,
         response_text: str,
         approval_granted: bool,
+        run_id: str | None = None,
+        status: str = "completed",
+        stop_reason: str | None = None,
+        occurrence_id: str | None = None,
     ) -> None:
-        """Mirror scheduled-task context into the chat users continue from."""
+        """Record bounded scheduled-task metadata for the chat users continue from."""
         visible_key = f"{channel}:{chat_id}"
         if not self._should_mirror_task_session(session_key, visible_key):
             return
 
+        # Scheduled execution has its complete trace in the detail session.
+        # Keep the visible chat's model-facing history bounded by storing only
+        # a compact run reference and excerpts in the metadata ring.  The
+        # compatibility ``get_history`` view can still synthesize the old
+        # instruction/result pair for trace readers without persisting another
+        # full turn in the visible JSONL.
         visible_session = self.sessions.get_or_create(visible_key)
-        label = "Scheduled task approval" if approval_granted else "Scheduled task"
-        task_snippet = task_text.strip()
-        if len(task_snippet) > 4000:
-            task_snippet = task_snippet[:4000].rstrip() + "\n... (truncated)"
-
-        visible_session.add_message(
-            "user",
-            (
-                f"[{label} from {session_key}]\n"
-                f"{task_snippet}"
-            ),
+        detail_id = session_key.split(":", 1)[1] if ":" in session_key else session_key
+        visible_session.add_scheduled_run(
+            job_id=detail_id,
+            run_id=run_id or f"legacy:{detail_id}",
+            instruction=task_text,
+            result=response_text,
+            detail_session_key=session_key,
+            status=status,
+            approval_granted=approval_granted,
+            stop_reason=stop_reason,
+            occurrence_id=occurrence_id,
         )
-        visible_session.add_message("assistant", response_text)
         self.sessions.save(visible_session)
 
     @staticmethod
@@ -720,6 +930,8 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> AgentRunResult:
         """Run a shared agent iteration loop and return the full result.
 
@@ -737,35 +949,87 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
         )
+        all_extra_hooks = [*self._extra_hooks, *(extra_hooks or [])]
         hook: AgentHook = (
-            _LoopHookChain(loop_hook, self._extra_hooks)
-            if self._extra_hooks
+            _LoopHookChain(loop_hook, all_extra_hooks)
+            if all_extra_hooks
             else loop_hook
         )
 
-        result = await self.runner.run(AgentRunSpec(
-            initial_messages=initial_messages,
-            tools=tools or self.tools,
-            model=self.model,
-            max_iterations=max_iterations or self.max_iterations,
-            hook=hook,
-            error_message="Sorry, I encountered an error calling the AI model.",
-            concurrent_tools=True,
-            tool_result_clearing_keep=(
-                None if preserve_tool_results else self.tool_result_clearing_keep
-            ),
-            tool_result_clear_trigger_tokens=(
-                None if preserve_tool_results else self._tool_result_clear_thresholds()[0]
-            ),
-            tool_result_clear_target_tokens=(
-                None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
-            ),
-            tool_policy=tool_policy,
-            max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
-            budget_manager=self.budget_manager,  # Pass unified budget manager for mid-loop enforcement
-        ))
+        base_tools = tools if tools is not None else self.tools
+        runner_tools = (
+            _ContextualToolRegistry(base_tools, turn_context)
+            if turn_context is not None
+            else base_tools
+        )
+        try:
+            result = await self.runner.run(AgentRunSpec(
+                initial_messages=initial_messages,
+                tools=runner_tools,
+                model=self.model,
+                max_iterations=max_iterations or self.max_iterations,
+                hook=hook,
+                error_message="Sorry, I encountered an error calling the AI model.",
+                concurrent_tools=True,
+                tool_result_clearing_keep=(
+                    None if preserve_tool_results else self.tool_result_clearing_keep
+                ),
+                tool_result_clear_trigger_tokens=(
+                    None if preserve_tool_results else self._tool_result_clear_thresholds()[0]
+                ),
+                tool_result_clear_target_tokens=(
+                    None if preserve_tool_results else self._tool_result_clear_thresholds()[1]
+                ),
+                tool_policy=tool_policy,
+                max_input_tokens=self.max_tokens.input if self.max_tokens.input > 0 else None,
+                budget_manager=self.budget_manager,  # Pass unified budget manager for mid-loop enforcement
+            ))
+        except _TurnStopError as stop:
+            context_messages = turn_context.messages if turn_context is not None else initial_messages
+            context_tools = turn_context.tools_used if turn_context is not None else []
+            context_usage = (
+                turn_context.metadata.get("_turn_usage", {})
+                if turn_context is not None
+                else {}
+            )
+            context_events = (
+                turn_context.metadata.get("_turn_tool_events", [])
+                if turn_context is not None
+                else []
+            )
+            result = AgentRunResult(
+                final_content=(
+                    stop.content
+                    if isinstance(stop.content, str)
+                    else str(stop.content or "")
+                ),
+                messages=context_messages,
+                tools_used=list(context_tools),
+                usage=dict(context_usage),
+                stop_reason=stop.stop_reason,
+                tool_events=list(context_events),
+                policy_metadata=dict(stop.policy_metadata),
+            )
         self._last_usage = result.usage
+        if turn_context is not None:
+            turn_context.messages = result.messages
+            turn_context.tools_used = list(result.tools_used)
+            turn_context.tool_results = list(result.tool_events)
+            marker = turn_context.metadata.get("_tool_stop_reason")
+            if marker and result.stop_reason in {"completed", "max_iterations"}:
+                result.stop_reason = str(marker)
+                stop_content = turn_context.metadata.get("_tool_stop_content")
+                if stop_content is not None:
+                    result.final_content = (
+                        stop_content
+                        if isinstance(stop_content, str)
+                        else str(stop_content)
+                    )
+                result.policy_metadata = dict(
+                    turn_context.metadata.get("_tool_policy_metadata") or {}
+                )
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", max_iterations or self.max_iterations)
         elif result.stop_reason == "error":
@@ -786,6 +1050,8 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         result = await self._run_agent(
             initial_messages,
@@ -799,6 +1065,8 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
+            extra_hooks=extra_hooks,
         )
         return result.final_content, result.tools_used, result.messages
 
@@ -815,6 +1083,8 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         approval_granted: bool = False,
         tools: ToolRegistry | None = None,
+        turn_context: TurnContext | None = None,
+        extra_hooks: list[AgentHook] | tuple[AgentHook, ...] | None = None,
     ) -> AgentRunResult:
         """Run the single main-agent orchestrator loop."""
         policy = RiskyActionPolicy(
@@ -839,6 +1109,8 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=session_key,
+            turn_context=turn_context,
+            extra_hooks=extra_hooks,
         )
 
     async def run(self) -> None:
@@ -882,9 +1154,19 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
-        gate = self._concurrency_gate or nullcontext()
-        async with lock, gate:
+        # ``execute_turn`` owns both the authoritative session lock and the
+        # cross-session concurrency gate.  Keep this adapter's indentation and
+        # publication behavior while avoiding a second lock around the runner.
+        # A direct test/integration replacement of ``_process_message`` predates
+        # the canonical adapter and still needs the compatibility lock.
+        process_impl = getattr(self._process_message, "__func__", None)
+        if process_impl is AgentLoop._process_message:
+            dispatch_lock = nullcontext()
+            dispatch_gate = nullcontext()
+        else:
+            dispatch_lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+            dispatch_gate = self._concurrency_gate or nullcontext()
+        async with dispatch_lock, dispatch_gate:
             try:
                 on_stream = on_stream_end = None
                 stream_content_published = False
@@ -1041,6 +1323,477 @@ class AgentLoop:
                 task.cancel()
         self._background_tasks.clear()
 
+    @staticmethod
+    def _request_route(request: TurnRequest) -> tuple[str, str, str, DeliveryTarget]:
+        """Resolve one request's session key and visible delivery target."""
+        target = request.delivery_target or request.route
+        channel = target.channel if target is not None else ""
+        chat_id = (
+            target.chat_id or target.to or target.recipient
+            if target is not None
+            else ""
+        )
+        key = request.session_key
+        if not key:
+            key = f"{channel}:{chat_id}" if channel and chat_id else "cli:direct"
+        if not channel or not chat_id:
+            inferred_channel, separator, inferred_chat = key.partition(":")
+            channel = inferred_channel if separator else "cli"
+            chat_id = inferred_chat if separator else key
+        if target is None or not target.channel or not (
+            target.chat_id or target.to or target.recipient
+        ):
+            target = DeliveryTarget(
+                channel=channel,
+                chat_id=chat_id,
+                message_id=target.message_id if target is not None else None,
+            )
+        return key, channel, chat_id, target
+
+    @staticmethod
+    def _new_run_id(requested: str | None) -> str:
+        if requested and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", requested):
+            return requested
+        import uuid
+
+        return uuid.uuid4().hex
+
+    @staticmethod
+    def _run_status(stop_reason: str | None) -> RunStatus:
+        return {
+            "completed": RunStatus.COMPLETED,
+            "approval_required": RunStatus.APPROVAL_REQUIRED,
+            "policy_blocked": RunStatus.POLICY_BLOCKED,
+            "tool_error": RunStatus.TOOL_ERROR,
+            "max_iterations": RunStatus.MAX_ITERATIONS,
+            "cancelled": RunStatus.CANCELLED,
+            "error": RunStatus.ERROR,
+        }.get(stop_reason or "completed", RunStatus.COMPLETED)
+
+    def _finalize_run_record(
+        self,
+        record: RunRecord,
+        context: TurnContext,
+        result: TurnResult,
+        *,
+        status: RunStatus | None = None,
+    ) -> RunRecord:
+        """Persist a terminal, sanitized record and attach it to the result."""
+        record.status = status or result.status
+        record.updated_at = datetime.now(timezone.utc).isoformat()
+        record.completed_at = datetime.now(timezone.utc).isoformat()
+        record.stop_reason = result.stop_reason
+        record.tools_used = tuple(result.tools_used or context.tools_used)
+        record.usage = dict(result.usage or {})
+        if result.error:
+            record.error_type = "error"
+        if context.session_key and (
+            record.session_ref is None or record.session_ref.session_key != context.session_key
+        ):
+            record.session_ref = SessionRunRef(session_key=context.session_key, run_id=record.run_id)
+            record.detail_ref = record.session_ref
+            record.session_key = context.session_key
+        record = self.run_store.save(record)
+        result.record = record
+        return record
+
+    async def execute_turn(
+        self,
+        request: TurnRequest,
+        *,
+        _tools: ToolRegistry | None = None,
+    ) -> TurnResult:
+        """Execute exactly one canonical, serialized agent turn."""
+        if not isinstance(request, TurnRequest):
+            raise TypeError("execute_turn expects a TurnRequest")
+
+        requested_key, channel, chat_id, target = self._request_route(request)
+        approval = await self._snapshot_approval(requested_key, request.content)
+        key = approval.effective_key
+        run_id = self._new_run_id(request.run_id)
+        started_at = datetime.now(timezone.utc)
+        context = TurnContext(
+            request=request,
+            run_id=run_id,
+            started_at=started_at,
+            session_key=key,
+            delegation_budget=self.delegation.new_budget(),
+            policy=RunPolicyContext(
+                approval_grant=request.approval_grant or (
+                    request.approval if request.approval.granted else None
+                ),
+                workspace=self.workspace,
+                approval_granted=bool(request.approval.granted),
+                source=request.source,
+                context_manager=self.context_manager,
+            ),
+            delivery=DeliveryState(primary=target, target=target),
+            lock_owner=f"main:{key}",
+            metadata=dict(request.metadata or {}),
+        )
+        # ``TurnRequest`` carries approval under both compatibility names; the
+        # explicit grant wins when present.
+        if request.approval_grant is not None:
+            context.policy.approval_granted = bool(request.approval_grant.granted)
+        elif request.approval.granted:
+            context.policy.approval_granted = True
+
+        record = RunRecord(
+            run_id=run_id,
+            status=RunStatus.RUNNING,
+            source=request.source,
+            detail_ref=SessionRunRef(session_key=key, run_id=run_id),
+            session_ref=SessionRunRef(session_key=key, run_id=run_id),
+            visible_session_key=request.scheduled_link.visible_session_key
+            if request.scheduled_link is not None and request.scheduled_link.visible_session_key
+            else f"{channel}:{chat_id}",
+            resumed_run_id=(
+                request.approval_grant.resumed_run_id
+                if request.approval_grant is not None
+                else None
+            ),
+            started_at=started_at.isoformat(),
+            updated_at=started_at.isoformat(),
+            metadata=dict(request.metadata or {}),
+            delivery_target=target,
+            scheduled_link=request.scheduled_link,
+        )
+        self.run_store.save(record)
+
+        lock = self._session_locks.setdefault(key, asyncio.Lock())
+        gate = self._concurrency_gate or nullcontext()
+        token = set_current_turn_context(context)
+        result: TurnResult | None = None
+        try:
+            async with lock, gate:
+                if approval.pending is not None and approval.action in {
+                    "affirmative",
+                    "negative",
+                    "other",
+                }:
+                    async with self._approval_guard:
+                        current = self._pending_approvals.get(approval.alias_key)
+                        if current is not approval.pending:
+                            result = TurnResult(
+                                run_id=run_id,
+                                status=RunStatus.CANCELLED,
+                                content=_STALE_APPROVAL_MESSAGE,
+                                final_content=_STALE_APPROVAL_MESSAGE,
+                                stop_reason="approval_stale",
+                                outbound=OutboundMessage(
+                                    channel=channel,
+                                    chat_id=chat_id,
+                                    content=_STALE_APPROVAL_MESSAGE,
+                                    metadata=dict(request.metadata or {}),
+                                ),
+                                messages=[],
+                            )
+                        else:
+                            self._remove_pending_approval_identity_locked(approval.pending)
+                            if approval.action == "negative":
+                                result = TurnResult(
+                                    run_id=run_id,
+                                    status=RunStatus.CANCELLED,
+                                    content="Cancelled the pending risky action.",
+                                    final_content="Cancelled the pending risky action.",
+                                    stop_reason="cancelled",
+                                    outbound=OutboundMessage(
+                                        channel=channel,
+                                        chat_id=chat_id,
+                                        content="Cancelled the pending risky action.",
+                                        metadata=dict(request.metadata or {}),
+                                    ),
+                                    messages=[],
+                                )
+                            elif approval.action == "affirmative":
+                                context.policy.approval_granted = True
+
+                if result is None:
+                    await self._connect_mcp()
+                    result = await self._execute_turn_locked(
+                        request,
+                        context,
+                        record,
+                        channel=channel,
+                        chat_id=chat_id,
+                        tools=_tools,
+                        approval_action=approval.action,
+                        approval_pending=approval.pending,
+                    )
+        except asyncio.CancelledError:
+            context.cancelled = True
+            cancelled = TurnResult(
+                run_id=run_id,
+                status=RunStatus.CANCELLED,
+                stop_reason="cancelled",
+                error="turn cancelled",
+                content=None,
+                final_content=None,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, cancelled, status=RunStatus.CANCELLED)
+            raise
+        except PromptBudgetExceeded as exc:
+            # Budget failures are deterministic local validation outcomes. Do
+            # not log a traceback here: traceback formatting can expose the
+            # oversized message payload through local-variable rendering.
+            result = TurnResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                content=None,
+                final_content=None,
+                stop_reason="prompt_budget_exceeded",
+                error=str(exc),
+                outbound=None,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, result, status=RunStatus.ERROR)
+            callback = request.callbacks.on_error
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        except Exception as exc:
+            logger.exception("Error executing canonical turn {}", run_id)
+            error = f"Error: {type(exc).__name__}: {exc}"
+            outbound = OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="Sorry, I encountered an error.",
+                metadata=dict(request.metadata or {}),
+            )
+            result = TurnResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                content=outbound.content,
+                final_content=outbound.content,
+                stop_reason="error",
+                error=error,
+                outbound=outbound,
+                sent_messages=tuple(context.delivery.sent_messages),
+            )
+            self._finalize_run_record(record, context, result, status=RunStatus.ERROR)
+            callback = request.callbacks.on_error
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        else:
+            if (
+                result is not None
+                and result.status is not RunStatus.COMMAND
+                and result.stop_reason not in {"cancelled", "approval_stale"}
+                and self._should_mirror_task_session(
+                    context.session_key or key,
+                    f"{channel}:{chat_id}",
+                )
+            ):
+                visible_key = f"{channel}:{chat_id}"
+                visible_lock = self._session_locks.setdefault(visible_key, asyncio.Lock())
+                async with visible_lock:
+                    self._mirror_task_session_to_visible_chat(
+                        session_key=context.session_key or key,
+                        channel=channel,
+                        chat_id=chat_id,
+                        task_text=str(
+                            context.metadata.get("_mirror_task_text", request.content)
+                        ),
+                        response_text=result.content or result.final_content or "",
+                        approval_granted=bool(context.policy.approval_granted),
+                        run_id=context.run_id,
+                        status=getattr(result.status, "value", str(result.status)),
+                        stop_reason=result.stop_reason,
+                        occurrence_id=(
+                            request.scheduled_link.occurrence_id
+                            if request.scheduled_link is not None
+                            else None
+                        ),
+                    )
+            assert result is not None
+            result.run_id = run_id
+            result.sent_messages = tuple(context.delivery.sent_messages)
+            result.policy_metadata = result.policy_metadata or context.policy.metadata
+            self._finalize_run_record(record, context, result)
+            callback = request.callbacks.on_error if result.error else request.callbacks.on_complete
+            if callback is not None:
+                try:
+                    callback_result = callback(result)
+                    if hasattr(callback_result, "__await__"):
+                        await callback_result
+                except Exception:
+                    logger.exception("Turn callback failed for {}", run_id)
+        finally:
+            reset_current_turn_context(token)
+        return result
+
+    async def _execute_turn_locked(
+        self,
+        request: TurnRequest,
+        context: TurnContext,
+        record: RunRecord,
+        *,
+        channel: str,
+        chat_id: str,
+        tools: ToolRegistry | None = None,
+        approval_action: str = "none",
+        approval_pending: _PendingApproval | None = None,
+    ) -> TurnResult:
+        """Run the canonical body after ``execute_turn`` acquires its locks."""
+        msg = InboundMessage(
+            channel=channel,
+            sender_id=request.sender_id,
+            chat_id=chat_id,
+            content=request.content,
+            media=list(request.media),
+            metadata=dict(request.metadata or {}),
+            session_key_override=context.session_key
+            if context.session_key != f"{channel}:{chat_id}"
+            else None,
+        )
+
+        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        key = context.session_key or msg.session_key
+        session = self.sessions.get_or_create(key)
+        raw = msg.content.strip()
+        command_context = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if command_result := await self.commands.dispatch(command_context):
+            return TurnResult(
+                run_id=context.run_id,
+                status=RunStatus.COMMAND,
+                content=command_result.content,
+                final_content=command_result.content,
+                outbound=command_result,
+                messages=[],
+            )
+
+        history = (
+            []
+            if request.history_mode is HistoryMode.FRESH
+            else session.get_model_history(max_messages=0)
+        )
+        current_message = msg.content
+        if approval_action == "affirmative" and approval_pending is not None:
+            current_message = (
+                "The user approved the previously blocked risky action. "
+                f"Resume the task that required approval: {approval_pending.summary}."
+                f"\n\nOriginal approval reply: {msg.content}"
+            )
+        context.metadata["_mirror_task_text"] = current_message
+
+        effective_tools = tools if tools is not None else (
+            self.tools.filtered(list(request.tool_names))
+            if request.tool_names is not None
+            else self.tools
+        )
+        tool_names_set = (
+            set(effective_tools.tool_names) if effective_tools is not self.tools else None
+        )
+        initial_messages = self.context.build_messages(
+            history=history,
+            current_message=current_message,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            tool_names=tool_names_set,
+            inject_memory=True,
+        )
+        if self.budget_manager is not None:
+            initial_messages = await self.budget_manager.enforce_budget(
+                initial_messages,
+                preserve_last_n_turns=self.tool_result_clearing_keep,
+            )
+        save_from = len(initial_messages) - 1
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=meta,
+            ))
+
+        result = await self._run_main_task(
+            initial_messages,
+            session_key=key,
+            on_progress=request.callbacks.on_progress or _bus_progress,
+            on_stream=request.callbacks.on_stream,
+            on_stream_end=request.callbacks.on_stream_end,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            message_id=target_message_id(context.delivery.primary),
+            approval_granted=bool(context.policy.approval_granted),
+            tools=effective_tools,
+            turn_context=context,
+            extra_hooks=list(request.hooks),
+        )
+        final_content = result.final_content or "I've completed processing but have no response to give."
+        context.tools_used = list(result.tools_used)
+        self._save_turn(session, result.messages, save_from, run_id=context.run_id)
+        self.sessions.save(session)
+        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        if key.startswith("cron:"):
+            await self._sync_context_repos()
+        else:
+            self._maybe_sync_context_repo()
+
+        if result.stop_reason == "approval_required":
+            summary = str(result.policy_metadata.get("summary") or "risky action")
+            await self._store_pending_approval(
+                session_key=key,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                summary=summary,
+            )
+        primary = context.delivery.primary or context.delivery.target
+        primary_chat = primary.chat_id or primary.to or primary.recipient if primary else None
+        final_text = final_content.strip() if isinstance(final_content, str) else ""
+        sent_to_primary = any(
+            sent.channel == primary.channel
+            and sent.chat_id == primary_chat
+            and isinstance(sent.content, str)
+            and bool(sent.content.strip())
+            and bool(final_text)
+            and sent.content.strip() == final_text
+            for sent in context.delivery.sent_messages
+        ) if primary else False
+        outbound: OutboundMessage | None
+        if sent_to_primary:
+            outbound = None
+        else:
+            meta = dict(msg.metadata or {})
+            if request.callbacks.on_stream is not None and result.stop_reason != "approval_required":
+                meta["_streamed"] = True
+            outbound = OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+                metadata=meta,
+            )
+        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, final_content[:120])
+        return TurnResult(
+            run_id=context.run_id,
+            status=self._run_status(result.stop_reason),
+            content=final_content,
+            final_content=final_content,
+            stop_reason=result.stop_reason,
+            error=result.error,
+            usage=result.usage,
+            tools_used=list(result.tools_used),
+            outbound=outbound,
+            policy_metadata=result.policy_metadata,
+            messages=result.messages,
+        )
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1051,211 +1804,62 @@ class AgentLoop:
         approval_granted: bool = False,
         tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
-        """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        """Compatibility adapter around :meth:`execute_turn`."""
+        source = TurnSource.SYSTEM_COMPAT if msg.channel == "system" else TurnSource.GATEWAY
         if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), key)
-            history = session.get_history(max_messages=0)
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-                current_role="user",
-            )
-
-            if self.max_tokens.input > 0:
-                try:
-                    sys_tool_defs = self.tools.get_definitions()
-                    tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, sys_tool_defs)
-                    if tokens > self.max_tokens.input:
-                        logger.warning(
-                            "System context size ({}) exceeds maxTokens.input ({}). Trimming oldest turns.",
-                            tokens,
-                            self.max_tokens.input,
-                        )
-                        while tokens > self.max_tokens.input and history:
-                            history.pop(0)
-                            messages = self.context.build_messages(
-                                history=history,
-                                current_message=msg.content,
-                                channel=channel,
-                                chat_id=chat_id,
-                                current_role="user",
-                            )
-                            tokens, _ = estimate_prompt_tokens_chain(
-                                self.provider,
-                                self.model,
-                                messages,
-                                sys_tool_defs,
-                            )
-                except Exception as e:
-                    logger.error("Failed to check system token count: {}", e)
-
-            save_from = len(messages) - 1
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-                session_key=key,
-            )
-            self._save_turn(session, all_msgs, save_from)
-            self.sessions.save(session)
-            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-            if key.startswith("cron:"):
-                await self._sync_context_repos()
+            if ":" in msg.chat_id:
+                route_channel, route_chat = msg.chat_id.split(":", 1)
             else:
-                self._maybe_sync_context_repo()
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=final_content or "Task completed.",
+                route_channel, route_chat = "cli", msg.chat_id
+            compat_session_key = session_key or f"{route_channel}:{route_chat}"
+            warnings.warn(
+                "Deprecated system message compatibility adapter used; "
+                "use execute_turn(TurnRequest(...)) instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
-
-        # Slash commands
-        raw = msg.content.strip()
-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
-            return result
-
-        pending = self._pending_approvals.get(key)
-        approval_note: str | None = None
-        if pending:
-            if self._is_affirmative(raw):
-                if pending.session_key != key:
-                    key = pending.session_key
-                    session = self.sessions.get_or_create(key)
-                approval_note = (
-                    "The user approved the previously blocked risky action. "
-                    f"Resume the task that required approval: {pending.summary}."
-                )
-                self._clear_pending_approval(key, pending)
-            elif self._is_negative(raw):
-                self._clear_pending_approval(key, pending)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Cancelled the pending risky action.",
-                    metadata=msg.metadata or {},
-                )
-            else:
-                # A new request supersedes the older pending approval.
-                self._clear_pending_approval(key, pending)
-
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), key)
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
-        self.delegation.start_turn()
-
-        history = session.get_history(max_messages=0)
-        current_message = msg.content
-        if approval_note:
-            current_message = f"{approval_note}\n\nOriginal approval reply: {msg.content}"
-
-        # Use filtered tool set if provided, otherwise full set.
-        effective_tools = tools if tools is not None else self.tools
-        tool_names_set = set(effective_tools.tool_names) if tools is not None else None
-
-        # Unified context model: memory injected as [Past Knowledge] message
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=current_message,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-            tool_names=tool_names_set,
-            inject_memory=True,
-        )
-
-        # Enforce budget using unified manager (handles all reduction strategies)
-        if self.budget_manager is not None:
-            initial_messages = await self.budget_manager.enforce_budget(
-                initial_messages,
-                preserve_last_n_turns=self.tool_result_clearing_keep,
+            logger.warning(
+                "Deprecated system message compatibility adapter used",
+                event="system_compat",
+                channel=route_channel,
+                chat_id=route_chat,
+                session_key=compat_session_key,
             )
-        # The current user message is always the final initial message. Saving
-        # from this index avoids persisting injected memory or duplicating the
-        # last history entry when [Past Knowledge] is present.
-        save_from = len(initial_messages) - 1
-
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
-        result = await self._run_main_task(
-            initial_messages,
-            session_key=key,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-            approval_granted=approval_granted or approval_note is not None,
-            tools=tools,
-        )
-        final_content = result.final_content
-        all_msgs = result.messages
-
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-
-        self._save_turn(session, all_msgs, save_from)
-        self.sessions.save(session)
-        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-        if key.startswith("cron:"):
-            await self._sync_context_repos()
         else:
-            self._maybe_sync_context_repo()
-
-        if result.stop_reason == "approval_required":
-            summary = str(result.policy_metadata.get("summary") or "risky action")
-            self._store_pending_approval(
-                session_key=key,
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                summary=summary,
-            )
-
-        self._mirror_task_session_to_visible_chat(
-            session_key=key,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            task_text=current_message,
-            response_text=final_content,
-            approval_granted=approval_granted or approval_note is not None,
+            route_channel, route_chat = msg.channel, msg.chat_id
+            compat_session_key = session_key or msg.session_key
+        route = DeliveryTarget(
+            channel=route_channel,
+            chat_id=route_chat,
+            message_id=msg.metadata.get("message_id"),
         )
-
-        # A successful direct send is already the user-facing result, including
-        # scheduled turns. Do not publish the model's trailing completion recap.
-        if (
-            (mt := self.tools.get("message"))
-            and isinstance(mt, MessageTool)
-            and mt._sent_in_turn
-        ):
-            return None
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        meta = dict(msg.metadata or {})
-        if on_stream is not None and result.stop_reason != "approval_required":
-            meta["_streamed"] = True
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=meta,
+        grant = ApprovalGrant(approved=True, source="compat") if approval_granted else None
+        request = TurnRequest(
+            content=msg.content,
+            source=source,
+            session_key=compat_session_key,
+            route=route,
+            sender_id=msg.sender_id,
+            media=tuple(msg.media),
+            approval_grant=grant,
+            approval=grant or ApprovalGrant(),
+            callbacks=TurnCallbacks(
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            ),
+            metadata=dict(msg.metadata or {}),
+            tool_names=tuple(tools.tool_names) if tools is not None else None,
         )
+        result = await self.execute_turn(request, _tools=tools)
+        # Keep the legacy inspection properties useful for callers that still
+        # invoke ``_process_message`` directly.  Canonical execution itself
+        # uses only ``TurnResult.sent_messages`` and never reads these fields.
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool._sent_messages_in_turn = list(result.sent_messages)
+            message_tool._sent_in_turn = result.outbound is None and bool(result.sent_messages)
+        return result.outbound
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -1303,7 +1907,14 @@ class AgentLoop:
 
         return filtered
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
@@ -1341,7 +1952,19 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
+            if run_id:
+                # SessionManager strips this internal marker from model history
+                # while RunStore can resolve the detailed trace by run ID.
+                entry.pop("role", None)
+                entry.pop("_run_id", None)
+                session.add_run_message(
+                    run_id,
+                    str(role or "assistant"),
+                    entry.pop("content", ""),
+                    **entry,
+                )
+            else:
+                session.messages.append(entry)
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session: Session, archive_all: bool = False) -> bool:
@@ -1411,12 +2034,22 @@ class AgentLoop:
         system prompt token count — useful for lightweight scheduled tasks on
         resource-constrained devices.
         """
-        await self._connect_mcp()
         tools = self.tools.filtered(tool_names) if tool_names else None
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        return await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress,
-            on_stream=on_stream, on_stream_end=on_stream_end,
-            approval_granted=approval_granted,
-            tools=tools,
+        grant = ApprovalGrant(approved=True, source="direct") if approval_granted else None
+        request = TurnRequest(
+            content=content,
+            source=TurnSource.DIRECT,
+            session_key=session_key,
+            route=DeliveryTarget(channel=channel, chat_id=chat_id),
+            sender_id="user",
+            approval_grant=grant,
+            approval=grant or ApprovalGrant(),
+            callbacks=TurnCallbacks(
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            ),
+            tool_names=tuple(tool_names) if tool_names else None,
         )
+        result = await self.execute_turn(request, _tools=tools)
+        return result.outbound

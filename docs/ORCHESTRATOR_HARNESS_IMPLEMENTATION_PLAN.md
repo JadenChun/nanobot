@@ -1,6 +1,6 @@
 # Orchestrator Harness Implementation Plan
 
-Status: implemented and locally validated
+Status: hardening implementation complete and locally validated
 Scope: Nanobot agent harness only
 Deployment target: the existing Lightsail Nanobot service
 
@@ -39,6 +39,31 @@ result before continuing. Background subagents remain unavailable.
   performance rather than mechanically consuming only the newest file. The idea identifies the
   trend evidence and performance learning that informed it; incomplete or stale evidence is
   disclosed rather than fabricated.
+
+## Turn execution hardening
+
+All gateway, direct, API, SDK, cron, heartbeat, and channel compatibility
+inputs converge on `AgentLoop.execute_turn`; `process_direct` remains only as a
+thin compatibility adapter. SDK callers receive populated `tools_used`,
+`run_id`, and `stop_reason` fields. `RunResult.messages` is empty by default;
+callers must pass `include_messages=True` to receive a detached, sanitized
+trace with system prompts, internal metadata, media payloads, and tool-call
+arguments removed.
+
+Cron execution keeps a fresh run in the detail session `cron:<job-id>` without
+deleting prior detail. Each run record may carry its canonical `run_id` (older
+stores load with `None`), while the normal visible chat receives exactly the
+scheduled instruction and final outcome tagged with that run ID. Explicit
+attachment or auxiliary deliveries do not suppress the completed final text;
+identical deliveries are deduplicated per destination.
+
+The inbound `system` channel is a warning-only compatibility adapter. It
+parses the historical `channel:chat` value when needed, emits a
+`DeprecationWarning` and structured `system_compat` warning, and then follows
+the same `execute_turn` policy, budget, history, and persistence path as any
+other source. Remove this adapter after one minor compatibility window and
+zero observed use for 30 consecutive days. No run-trace HTTP endpoint or
+command is part of this hardening scope.
 
 ## Current implementation and problems
 
@@ -117,10 +142,28 @@ background task registries, completion notifications, or session mirroring.
 
 Add `nanobot/agent/tools/delegation.py` with three tools:
 
+Delegated registries are capability boundaries, not prompt-only conventions. The enforced role
+matrix is:
+
+| Role | Exact capabilities |
+|---|---|
+| Planner | `read_file`, `list_dir`, bounded Python `search_files`, `web_search`, `web_fetch`, and classified read-only MCP tools |
+| Reviewer | Planner capabilities plus observational `agent_browser` |
+| Explorer | Planner capabilities plus observational `agent_browser` and `agent_device` |
+| Crawler | `social_crawl` only |
+| Worker | Exactly `read_file`, `list_dir`, `write_file`, and `edit_file`; writes remain inside the declared scope |
+
+No delegated role receives raw `exec`, messaging, cron, desktop, or nested delegation tools. Browser
+and device sessions are shared state and are therefore serialized. Read-only browser navigation,
+inspection, screenshots, scrolling, and waiting are allowed; generic click/type/submit/evaluate or
+unknown actions are rejected before execution. The crawler exposes only validated
+`follow_link`/`expand`/`paginate` navigation in addition to open, inspect, scroll, and wait.
+
 ### `plan_task`
 
 - Input: the objective plus a plain-text context/evidence block.
-- Tools: read-only repository, web, and permitted MCP inspection tools.
+- Tools: exactly the Planner row above; repository search is a bounded Python operation and never
+  invokes a shell.
 - Output: a readable plan containing steps, dependencies, acceptance checks, references, risks,
   and unresolved questions.
 - It cannot write files or call other delegation tools.
@@ -130,7 +173,8 @@ Add `nanobot/agent/tools/delegation.py` with three tools:
 - Input: one human-readable Markdown task contract and an explicit `write_scope`.
 - The contract includes objective, current evidence, desired behavior, acceptance criteria,
   non-goals, allowed files, and validation commands.
-- Tools: read tools plus write/edit and policy-constrained execution inside `write_scope`.
+- Tools: exactly scoped `read_file`, `list_dir`, `write_file`, and `edit_file`; no worker shell is
+  available. Validation commands are returned to the main orchestrator to run.
 - It cannot call `message`, `cron`, approval-requiring external actions, or delegation tools.
 - Output: a readable completion report with status, acceptance evidence, modified files, tests,
   blockers, and remaining risks.
@@ -141,7 +185,7 @@ arguments; it must not replace raw evidence, HTML, excerpts, or references.
 ### `review_work`
 
 - Input: the goal, acceptance criteria, relevant paths, and a concise evidence block.
-- Tools: read-only file, shell, web, browser, and permitted MCP inspection tools.
+- Tools: exactly the Reviewer row above; it has no shell, device, write, or external-action tool.
 - Output: findings first, acceptance coverage, test gaps, residual risks, and
   `PASS | CORRECT | REJECT`.
 - It cannot modify files or call other delegation tools.
@@ -155,10 +199,14 @@ The main agent treats delegated output as evidence, not authority.
   sequentially.
 - A worker must receive at least one normalized workspace-relative write scope. A read-only task
   should use `explore`, `plan_task`, or `review_work` instead.
-- Worker filesystem tools enforce the declared scope. Shell execution is restricted to safe
-  workspace commands and cannot be used to bypass the scope.
-- The main agent remains the only component allowed to request approval, send messages, schedule
-  cron jobs, or perform deployment/publishing actions.
+- Worker filesystem tools enforce the declared scope and are the only delegated write path. The
+  main agent remains the only component allowed to request approval, send messages, schedule cron
+  jobs, or perform deployment/publishing actions.
+- A delegated read-only policy rejects any unsafe, unknown, malformed, or mixed browser/device/
+  crawler batch with `policy_blocked`. This stop is non-elevatable: parent approval is ignored,
+  no approval is requested or persisted, and the outer turn stops without another provider call.
+- The main risk policy classifies device actions as well as browser actions. Safe observation is
+  autonomous; device mutation or unknown actions use the existing run-wide approval flow.
 - Add a per-turn delegation budget, initially six total role calls and at most two worker
   correction calls. Exceeding it returns a clear tool error so the main agent can summarize the
   blocker instead of looping.
@@ -404,6 +452,10 @@ uv run pytest -q
 - Parallel foreground workers in the first version.
 - Restoring background agents or later completion notifications.
 - Letting delegated workers request approval or publish externally.
+- Pinning third-party npm packages or correcting MCP annotations in this package; those remain
+  deployment residual risks and must be addressed separately.
+- Defining URL data-exfiltration policy for browser output; existing URL/resource restrictions and
+  crawler host policy remain the current boundary.
 - Building a general persistent graph/workflow engine.
 - Adding separate models for every role before cost and quality are measured.
 - Changing EGOCAT research scope, report content, or client-facing report templates as part of

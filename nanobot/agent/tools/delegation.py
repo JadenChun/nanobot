@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import TurnContext
 
 if TYPE_CHECKING:
     from nanobot.agent.delegation import ForegroundAgentManager
@@ -39,8 +40,21 @@ class PlanTaskTool(_ForegroundTool):
         "additionalProperties": False,
     }
 
-    async def execute(self, objective: str, context: str = "", **_: Any) -> str:
-        return await self._manager.run_plan(objective=objective, context=context)
+    async def execute(
+        self,
+        objective: str,
+        context: str = "",
+        turn_context: TurnContext | None = None,
+        **_: Any,
+    ) -> str:
+        return await self._manager.run_plan(
+            objective=objective,
+            context=context,
+            turn_context=turn_context,
+        )
+
+    async def execute_with_context(self, turn_context: TurnContext, **kwargs: Any) -> Any:
+        return await self.execute(turn_context=turn_context, **kwargs)
 
 
 class DelegateTaskTool(_ForegroundTool):
@@ -69,8 +83,21 @@ class DelegateTaskTool(_ForegroundTool):
         "additionalProperties": False,
     }
 
-    async def execute(self, contract: str, write_scope: list[str], **_: Any) -> str:
-        return await self._manager.run_worker(contract=contract, write_scope=write_scope)
+    async def execute(
+        self,
+        contract: str,
+        write_scope: list[str],
+        turn_context: TurnContext | None = None,
+        **_: Any,
+    ) -> str:
+        return await self._manager.run_worker(
+            contract=contract,
+            write_scope=write_scope,
+            turn_context=turn_context,
+        )
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        return await self.execute(turn_context=context, **kwargs)
 
 
 class ReviewWorkTool(_ForegroundTool):
@@ -101,6 +128,7 @@ class ReviewWorkTool(_ForegroundTool):
         acceptance_criteria: str,
         evidence: str = "",
         relevant_paths: list[str] | None = None,
+        turn_context: TurnContext | None = None,
         **_: Any,
     ) -> str:
         return await self._manager.run_review(
@@ -108,7 +136,11 @@ class ReviewWorkTool(_ForegroundTool):
             acceptance_criteria=acceptance_criteria,
             evidence=evidence,
             relevant_paths=relevant_paths,
+            turn_context=turn_context,
         )
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        return await self.execute(turn_context=context, **kwargs)
 
 
 __all__ = ["DelegateTaskTool", "PlanTaskTool", "ReviewWorkTool"]

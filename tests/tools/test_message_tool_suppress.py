@@ -31,7 +31,7 @@ class TestMessageToolSuppressLogic:
         )
         calls = iter([
             LLMResponse(content="", tool_calls=[tool_call]),
-            LLMResponse(content="Done", tool_calls=[]),
+            LLMResponse(content="Hello", tool_calls=[]),
         ])
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
@@ -48,6 +48,65 @@ class TestMessageToolSuppressLogic:
         assert isinstance(mt, MessageTool)
         assert mt.sent_messages_in_turn == tuple(sent)
         assert result is None  # suppressed
+
+    @pytest.mark.asyncio
+    async def test_not_suppress_when_primary_message_is_auxiliary_text(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1", name="message",
+            arguments={"content": "Attachment ready", "channel": "feishu", "chat_id": "chat123"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="The final answer", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
+        result = await loop._process_message(msg)
+
+        assert len(sent) == 1
+        assert result is not None
+        assert result.content == "The final answer"
+
+    @pytest.mark.asyncio
+    async def test_not_suppress_when_primary_send_only_has_attachment(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1", name="message",
+            arguments={
+                "content": "",
+                "channel": "feishu",
+                "chat_id": "chat123",
+                "media": ["report.pdf"],
+            },
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="The report is attached", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
+        result = await loop._process_message(msg)
+
+        assert len(sent) == 1
+        assert sent[0].content == ""
+        assert sent[0].media == ["report.pdf"]
+        assert result is not None
+        assert result.content == "The report is attached"
 
     @pytest.mark.asyncio
     async def test_not_suppress_when_sent_to_different_target(self, tmp_path: Path) -> None:
@@ -86,7 +145,7 @@ class TestMessageToolSuppressLogic:
         )
         calls = iter([
             LLMResponse(content="", tool_calls=[tool_call]),
-            LLMResponse(content="Final scheduled result", tool_calls=[]),
+            LLMResponse(content="Attachment ready", tool_calls=[]),
         ])
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])

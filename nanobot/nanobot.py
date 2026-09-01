@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.message_content import content_to_text
+from nanobot.agent.turn import DeliveryTarget, TraceMode, TurnRequest, TurnSource
 from nanobot.bus.queue import MessageBus
 
 
@@ -15,9 +18,60 @@ from nanobot.bus.queue import MessageBus
 class RunResult:
     """Result of a single agent run."""
 
-    content: str
-    tools_used: list[str]
-    messages: list[dict[str, Any]]
+    content: str = ""
+    tools_used: list[str] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    run_id: str | None = None
+    stop_reason: str | None = None
+
+
+def _sanitize_trace(messages: Any) -> list[dict[str, Any]]:
+    """Return a detached, bounded SDK trace without internal/raw fields.
+
+    The canonical loop retains the full provider exchange for session
+    persistence.  SDK callers only receive this reduced view when explicitly
+    opting in: system prompts, internal metadata, media payloads, and tool
+    arguments are omitted while textual content remains useful for debugging.
+    """
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
+        return []
+
+    detached: list[dict[str, Any]] = []
+    for raw in messages:
+        if not isinstance(raw, Mapping):
+            continue
+        role = raw.get("role")
+        if role == "system" or not role:
+            continue
+
+        entry: dict[str, Any] = {"role": str(role)}
+        if "content" in raw:
+            entry["content"] = content_to_text(raw.get("content"), max_chars=4_000)
+
+        if role == "assistant" and isinstance(raw.get("tool_calls"), Sequence):
+            calls: list[dict[str, str]] = []
+            for raw_call in raw["tool_calls"]:
+                if not isinstance(raw_call, Mapping):
+                    continue
+                function = raw_call.get("function")
+                name = function.get("name") if isinstance(function, Mapping) else None
+                call: dict[str, str] = {}
+                if raw_call.get("id"):
+                    call["id"] = str(raw_call["id"])
+                if name:
+                    call["name"] = str(name)
+                if call:
+                    calls.append(call)
+            if calls:
+                entry["tool_calls"] = calls
+        elif role == "tool":
+            if raw.get("tool_call_id"):
+                entry["tool_call_id"] = str(raw["tool_call_id"])
+            if raw.get("name"):
+                entry["name"] = str(raw["name"])
+
+        detached.append(entry)
+    return detached
 
 
 class Nanobot:
@@ -98,6 +152,7 @@ class Nanobot:
         *,
         session_key: str = "sdk:default",
         hooks: list[AgentHook] | None = None,
+        include_messages: bool = False,
     ) -> RunResult:
         """Run the agent once and return the result.
 
@@ -106,19 +161,51 @@ class Nanobot:
             session_key: Session identifier for conversation isolation.
                 Different keys get independent history.
             hooks: Optional lifecycle hooks for this run.
+            include_messages: Include a detached, sanitized execution trace.
         """
-        prev = self._loop._extra_hooks
-        if hooks is not None:
-            self._loop._extra_hooks = list(hooks)
-        try:
-            response = await self._loop.process_direct(
-                message, session_key=session_key,
-            )
-        finally:
-            self._loop._extra_hooks = prev
+        request = TurnRequest(
+            content=message,
+            source=TurnSource.SDK,
+            session_key=session_key,
+            route=DeliveryTarget(channel="sdk", chat_id=session_key),
+            hooks=tuple(hooks or ()),
+            trace_mode=(TraceMode.SANITIZED if include_messages else TraceMode.NONE),
+        )
+        response = await self._loop.execute_turn(request)
 
-        content = (response.content if response else None) or ""
-        return RunResult(content=content, tools_used=[], messages=[])
+        outbound = getattr(response, "outbound", None) if response is not None else None
+        raw_content = getattr(response, "content", None) if response is not None else None
+        if raw_content is None and outbound is not None:
+            raw_content = getattr(outbound, "content", None)
+        if raw_content is None and isinstance(response, str):
+            raw_content = response
+        content = str(raw_content or "")
+
+        raw_tools = getattr(response, "tools_used", ()) if response is not None else ()
+        if isinstance(raw_tools, str):
+            tools_used = [raw_tools]
+        else:
+            tools_used = list(raw_tools or ())
+
+        run_id = getattr(response, "run_id", None) if response is not None else None
+        run_id = str(run_id) if run_id else None
+        stop_reason = getattr(response, "stop_reason", None) if response is not None else None
+        stop_reason = getattr(stop_reason, "value", stop_reason)
+        stop_reason = str(stop_reason) if stop_reason else None
+
+        raw_messages = getattr(response, "messages", None) if response is not None else None
+        if include_messages and raw_messages is None and run_id:
+            run_store = getattr(self._loop, "run_store", None)
+            if run_store is not None:
+                raw_messages = run_store.load_trace(run_id)
+
+        return RunResult(
+            content=content,
+            tools_used=tools_used,
+            messages=_sanitize_trace(raw_messages) if include_messages else [],
+            run_id=run_id,
+            stop_reason=stop_reason,
+        )
 
 
 def _make_single_provider(config: Any, provider_name: str, model: str) -> Any:
@@ -222,6 +309,7 @@ def _make_provider(config: Any) -> Any:
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens.output,
         reasoning_effort=defaults.reasoning_effort,
+        context_window_tokens=defaults.max_tokens.input,
     )
 
     fallback_entries = defaults.fallback
@@ -260,5 +348,6 @@ def _make_crawler_provider(config: Any) -> Any | None:
         temperature=0.1,
         max_tokens=crawler.max_tokens.output,
         reasoning_effort=crawler.reasoning_effort,
+        context_window_tokens=crawler.max_tokens.input,
     )
     return provider

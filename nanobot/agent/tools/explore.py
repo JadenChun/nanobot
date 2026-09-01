@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import ToolOutcome, TurnContext
 
 
 class ExploreTool(Tool):
@@ -50,6 +51,26 @@ class ExploreTool(Tool):
             thoroughness=thoroughness,
             max_iterations=self._max_iterations,
         )
+
+        if isinstance(result, ToolOutcome):
+            return result
+
+        return self._format_result(result)
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        result = await self._manager.run_explore(
+            task=kwargs.get("task", ""),
+            thoroughness=kwargs.get("thoroughness", "medium"),
+            max_iterations=self._max_iterations,
+            turn_context=context,
+        )
+        if isinstance(result, ToolOutcome):
+            return result
+        return self._format_result(result)
+
+    @staticmethod
+    def _format_result(result: dict[str, Any]) -> str:
+        """Render normal exploration findings for the outer model."""
 
         lines: list[str] = ["[Explore Findings]"]
         if result.get("partial"):

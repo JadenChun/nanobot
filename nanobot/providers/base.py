@@ -1,6 +1,7 @@
 """Base LLM provider interface."""
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -10,6 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+
+from nanobot.utils.prompt_budget import (
+    PromptBudget,
+    assert_prompt_fits,
+)
 
 
 @dataclass
@@ -77,12 +83,16 @@ class GenerationSettings:
     temperature: float = 0.7
     max_tokens: int = 4096
     reasoning_effort: str | None = None
+    # Total logical context window.  Zero preserves provider-only callers that
+    # do not configure a bound; application factories always set this from
+    # ``maxTokens.input``.
+    context_window_tokens: int = 0
 
 
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -152,6 +162,49 @@ class LLMProvider(ABC):
     )
 
     _SENTINEL = object()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Put a budget guard in front of every concrete transport.
+
+        Providers historically implemented ``chat`` directly, so the retry
+        helpers were not a sufficient boundary: callers could bypass them by
+        invoking a provider transport (or a streaming override) themselves.
+        Wrapping only methods defined by the new subclass keeps inheritance
+        predictable and the marker makes repeated class construction
+        idempotent.
+        """
+        super().__init_subclass__(**kwargs)
+
+        def wrap_transport(name: str) -> None:
+            implementation = cls.__dict__.get(name)
+            if implementation is None or not callable(implementation):
+                return
+            if getattr(implementation, "_nanobot_budget_guard", False):
+                return
+
+            @functools.wraps(implementation)
+            async def guarded(self: "LLMProvider", *args: Any, **call_kwargs: Any) -> LLMResponse:
+                # The abstract signatures put messages first, tools second,
+                # model third, and max_tokens fourth.  Keyword calls remain
+                # the normal path, while positional extraction keeps direct
+                # provider calls covered too.
+                def argument(name: str, position: int, default: Any = None) -> Any:
+                    if name in call_kwargs:
+                        return call_kwargs[name]
+                    return args[position] if len(args) > position else default
+
+                messages = argument("messages", 0, [])
+                tools = argument("tools", 1, None)
+                model = argument("model", 2, None)
+                max_tokens = argument("max_tokens", 3, self.generation.max_tokens)
+                self._assert_prompt_budget(messages, tools, model, max_tokens)
+                return await implementation(self, *args, **call_kwargs)
+
+            guarded._nanobot_budget_guard = True  # type: ignore[attr-defined]
+            setattr(cls, name, guarded)
+
+        wrap_transport("chat")
+        wrap_transport("chat_stream")
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
@@ -250,7 +303,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -258,7 +311,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -580,6 +633,7 @@ class LLMProvider(ABC):
         full content as a single delta.  Providers that support native
         streaming should override this method.
         """
+        self._assert_prompt_budget(messages, tools, model, max_tokens)
         response = await self.chat(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
@@ -588,6 +642,30 @@ class LLMProvider(ABC):
         if on_content_delta and response.content:
             await on_content_delta(response.content)
         return response
+
+    def _prompt_budget(self, max_tokens: int | object) -> PromptBudget | None:
+        """Return this request's logical prompt budget, if configured."""
+        total = getattr(self.generation, "context_window_tokens", 0)
+        if not isinstance(total, (int, float)) or int(total) <= 0:
+            return None
+        reserve = max_tokens if isinstance(max_tokens, (int, float)) else 0
+        return PromptBudget(
+            total_tokens=int(total),
+            completion_reserve=max(0, int(reserve)),
+        )
+
+    def _assert_prompt_budget(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int | object,
+    ) -> None:
+        """Defend the actual transport boundary against oversized payloads."""
+        budget = self._prompt_budget(max_tokens)
+        if budget is None:
+            return
+        assert_prompt_fits(self, model, messages, tools, budget)
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
         """Call chat_stream() and convert unexpected exceptions to error responses."""
@@ -642,6 +720,7 @@ class LLMProvider(ABC):
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            self._assert_prompt_budget(messages, tools, model, max_tokens)
             response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
@@ -664,6 +743,7 @@ class LLMProvider(ABC):
                         "with text descriptions.",
                         type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
                     )
+                    self._assert_prompt_budget(described, tools, model, max_tokens)
                     return await self._safe_chat_stream(**{**kw, "messages": described})
                 stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
@@ -686,6 +766,7 @@ class LLMProvider(ABC):
                             type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
                             (response.content or "")[:300],
                         )
+                    self._assert_prompt_budget(stripped, tools, model, max_tokens)
                     return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
@@ -698,6 +779,7 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(effective_delay)
 
+        self._assert_prompt_budget(messages, tools, model, max_tokens)
         return await self._safe_chat_stream(**kw)
 
     async def chat_with_retry(
@@ -733,6 +815,7 @@ class LLMProvider(ABC):
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            self._assert_prompt_budget(messages, tools, model, max_tokens)
             response = await self._safe_chat(**kw)
 
             if response.finish_reason != "error":
@@ -752,7 +835,8 @@ class LLMProvider(ABC):
                         "with text descriptions.",
                         type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
                     )
-                    return await self._safe_chat_stream(**{**kw, "messages": described})
+                    self._assert_prompt_budget(described, tools, model, max_tokens)
+                    return await self._safe_chat(**{**kw, "messages": described})
                 stripped = self._strip_image_content(messages, reason=strip_reason)
                 if stripped is not None:
                     if too_large:
@@ -774,6 +858,7 @@ class LLMProvider(ABC):
                             type(self).__name__, model or getattr(self, "default_model", None) or "<unknown>",
                             (response.content or "")[:300],
                         )
+                    self._assert_prompt_budget(stripped, tools, model, max_tokens)
                     return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
@@ -785,6 +870,7 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(effective_delay)
 
+        self._assert_prompt_budget(messages, tools, model, max_tokens)
         return await self._safe_chat(**kw)
 
     @abstractmethod

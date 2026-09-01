@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from nanobot.agent.tools.process import await_owned_cleanup
+from nanobot.agent.tools.social_crawl import classify_crawler_action
+
 DEFAULT_SOCKET_PATH = "/run/crawl4ai-worker/worker.sock"
 DEFAULT_TCP_PORT = 18791
 DEFAULT_MAX_HTML_CHARS = 12000
@@ -189,12 +192,16 @@ class Crawl4AIWorker:
     async def _shutdown_browser(self) -> None:
         """Close all crawl state so a headed browser is not left visible while idle."""
         self.sessions.clear()
-        if self._crawler is not None:
+        crawler = self._crawler
+        self._crawler = None
+        if crawler is not None:
             try:
-                await self._crawler.close()
+                await await_owned_cleanup(
+                    crawler.close(),
+                    timeout=5.0,
+                )
             except Exception:
                 pass
-        self._crawler = None
 
     async def _ensure_browser_ready(self) -> None:
         if not self._browser_context_alive():
@@ -234,17 +241,34 @@ class Crawl4AIWorker:
         return page
 
     async def stop(self) -> None:
-        if self._crawler is not None:
+        cancelled = False
+        try:
             for session_id in list(self.sessions):
-                await self._kill_session(session_id)
-            await self._crawler.close()
-        if not self.tcp_host and self.socket_path.exists():
-            self.socket_path.unlink()
+                try:
+                    await self._kill_session(session_id)
+                except asyncio.CancelledError:
+                    cancelled = True
+            try:
+                await self._shutdown_browser()
+            except asyncio.CancelledError:
+                cancelled = True
+        except asyncio.CancelledError:
+            # _shutdown_browser has already bounded and joined its close task;
+            # still remove the local socket before propagating cancellation.
+            cancelled = True
+        finally:
+            if not self.tcp_host and self.socket_path.exists():
+                self.socket_path.unlink()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _kill_session(self, session_id: str) -> None:
         if self._crawler is not None and session_id in self.sessions:
             try:
-                await self._crawler.crawler_strategy.kill_session(session_id)
+                await await_owned_cleanup(
+                    self._crawler.crawler_strategy.kill_session(session_id),
+                    timeout=5.0,
+                )
             finally:
                 self.sessions.pop(session_id, None)
 
@@ -437,6 +461,81 @@ class Crawl4AIWorker:
             "screenshot_mime": "image/jpeg",
         }
 
+    @staticmethod
+    def _js_string_result(result: Any) -> str | None:
+        """Extract a bounded string returned by a worker-side JS primitive."""
+
+        execution = getattr(result, "js_execution_result", None)
+        if not isinstance(execution, dict):
+            return None
+        values = execution.get("results")
+        if not isinstance(values, list):
+            return None
+        for value in reversed(values):
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and not value.startswith('<section data-crawl4ai-viewport="true">')
+            ):
+                return value.strip()[:4096]
+        return None
+
+    async def _follow_validated_link(
+        self,
+        *,
+        session_id: str,
+        session: BrowserSession,
+        selector: str,
+        wait_ms: int,
+        timeout_seconds: int,
+        offset: int,
+        max_chars: int,
+        screenshot: bool,
+    ) -> dict[str, Any]:
+        """Follow an href selected by the page, then perform safe navigation."""
+
+        selector_literal = json.dumps(selector)
+        script = (
+            "(() => { const element = document.querySelector("
+            f"{selector_literal}); if (!element) return 'not-found'; "
+            "const link = element.closest('a[href]') || "
+            "(element.matches('a[href]') ? element : null); "
+            "return link ? link.href : 'no-link'; })()"
+        )
+        link_result = await self._crawl_result(
+            url=session.url,
+            session_id=session_id,
+            js_only=True,
+            selector=None,
+            js_code=script,
+            wait_ms=wait_ms,
+            timeout_seconds=timeout_seconds,
+            screenshot=False,
+        )
+        target = self._js_string_result(link_result)
+        if target in {None, "not-found", "no-link"}:
+            raise WorkerRequestError("selector did not resolve to a link")
+        target = self._validate_url(target)
+        await self._validate_public_dns(target)
+        result = await self._crawl_result(
+            url=target,
+            session_id=session_id,
+            js_only=False,
+            selector=None,
+            js_code=None,
+            wait_ms=wait_ms,
+            timeout_seconds=timeout_seconds,
+            screenshot=screenshot,
+        )
+        session.url = self._validate_url(str(result.url or target))
+        await self._validate_public_dns(session.url)
+        return self._html_payload(
+            result,
+            session_id=session_id,
+            offset=offset,
+            max_chars=max_chars,
+        )
+
     async def _crawl_result(
         self,
         *,
@@ -485,16 +584,28 @@ class Crawl4AIWorker:
             remove_overlay_elements=False,
             verbose=False,
         )
-        result = await asyncio.wait_for(
-            self._crawler.arun(url=url, config=config),
-            timeout=timeout_seconds + 10,
-        )
+        try:
+            result = await asyncio.wait_for(
+                self._crawler.arun(url=url, config=config),
+                timeout=timeout_seconds + 10,
+            )
+        except asyncio.TimeoutError:
+            await self._kill_session(session_id)
+            raise WorkerRequestError("browser operation timed out")
+        except asyncio.CancelledError:
+            # A cancelled crawl must not leave a live Chromium page/session.
+            await self._kill_session(session_id)
+            raise
         if not result.success:
             raise WorkerRequestError(str(result.error_message or "browser crawl failed")[:400])
         return result
 
     async def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         op = request.get("op")
+        # Keep this rejection before browser/session recovery so even direct
+        # local-socket or unauthenticated callers cannot trigger a click.
+        if isinstance(op, str) and op.strip().lower() == "click":
+            raise WorkerRequestError("click is disabled for all crawler callers")
         if op == "health":
             async with self._operation_lock:
                 browser_ready = self._browser_context_alive()
@@ -529,9 +640,18 @@ class Crawl4AIWorker:
             await self._expire_sessions()
             if op == "reset":
                 reset_count = len(self.sessions)
+                cancelled = False
                 for session_id in list(self.sessions):
-                    await self._kill_session(session_id)
-                await self._shutdown_browser()
+                    try:
+                        await self._kill_session(session_id)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                try:
+                    await self._shutdown_browser()
+                except asyncio.CancelledError:
+                    cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
                 return {"ok": True, "reset_sessions": reset_count}
 
             max_chars = self._bounded_int(
@@ -585,9 +705,11 @@ class Crawl4AIWorker:
                 except Exception:
                     await self._kill_session(session_id)
                     raise
-                return self._html_payload(
+                payload = self._html_payload(
                     result, session_id=session_id, offset=offset, max_chars=max_chars
                 )
+                payload["action_class"] = classify_crawler_action(op)
+                return payload
 
             session_id, session = self._session(request)
             if op == "close":
@@ -611,23 +733,37 @@ class Crawl4AIWorker:
                 )
                 session.url = self._validate_url(str(result.url or url))
                 await self._validate_public_dns(session.url)
-                return self._html_payload(
+                payload = self._html_payload(
                     result, session_id=session_id, offset=offset, max_chars=max_chars
                 )
+                payload["action_class"] = classify_crawler_action(op)
+                return payload
+
+            if op in {"follow_link", "paginate"}:
+                selector = self._selector(request.get("selector"), required=True)
+                payload = await self._follow_validated_link(
+                    session_id=session_id,
+                    session=session,
+                    selector=selector,
+                    wait_ms=wait_ms,
+                    timeout_seconds=timeout_seconds,
+                    offset=offset,
+                    max_chars=max_chars,
+                    screenshot=True if capture_screenshot is None else capture_screenshot,
+                )
+                payload["action_class"] = classify_crawler_action(op)
+                return payload
             if op == "inspect":
                 selector = self._selector(request.get("selector"), required=False)
                 js_code = "void 0"
-            elif op == "click":
-                if self.authenticated_profile:
-                    raise WorkerRequestError(
-                        "click is disabled while the authenticated read-only profile is active"
-                    )
+            elif op == "expand":
                 selector = self._selector(request.get("selector"), required=True)
                 selector_literal = json.dumps(selector)
                 js_code = (
                     "(() => { const element = document.querySelector("
                     f"{selector_literal}); if (!element) return 'not-found'; "
-                    "element.click(); return 'clicked'; })()"
+                    "if (!element.matches('details, summary, [aria-expanded=\"false\"]')) "
+                    "return 'not-expandable'; element.click(); return 'expanded'; })()"
                 )
             elif op == "scroll":
                 pixels = self._bounded_int(
@@ -661,9 +797,11 @@ class Crawl4AIWorker:
                 candidate = self._validate_url(str(result.url))
                 await self._validate_public_dns(candidate)
                 session.url = candidate
-            return self._html_payload(
+            payload = self._html_payload(
                 result, session_id=session_id, offset=offset, max_chars=max_chars
             )
+            payload["action_class"] = classify_crawler_action(op)
+            return payload
 
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

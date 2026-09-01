@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-def _make_loop(*, exec_config=None, channels_config=None):
+def _make_loop(tmp_path, *, exec_config=None, channels_config=None):
     """Create a minimal AgentLoop with mocked dependencies."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
@@ -16,8 +16,7 @@ def _make_loop(*, exec_config=None, channels_config=None):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    workspace = tmp_path
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
@@ -34,24 +33,24 @@ def _make_loop(*, exec_config=None, channels_config=None):
 
 class TestHandleStop:
     @pytest.mark.asyncio
-    async def test_stop_no_active_task(self):
+    async def test_stop_no_active_task(self, tmp_path):
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_stop
         from nanobot.command.router import CommandContext
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
         ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
         out = await cmd_stop(ctx)
         assert "No active task" in out.content
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_active_task(self):
+    async def test_stop_cancels_active_task(self, tmp_path):
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_stop
         from nanobot.command.router import CommandContext
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         cancelled = asyncio.Event()
 
         async def slow_task():
@@ -73,12 +72,12 @@ class TestHandleStop:
         assert "stopped" in out.content.lower()
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_multiple_tasks(self):
+    async def test_stop_cancels_multiple_tasks(self, tmp_path):
         from nanobot.bus.events import InboundMessage
         from nanobot.command.builtin import cmd_stop
         from nanobot.command.router import CommandContext
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         events = [asyncio.Event(), asyncio.Event()]
 
         async def slow(idx):
@@ -101,18 +100,18 @@ class TestHandleStop:
 
 
 class TestDispatch:
-    def test_exec_tool_not_registered_when_disabled(self):
+    def test_exec_tool_not_registered_when_disabled(self, tmp_path):
         from nanobot.config.schema import ExecToolConfig
 
-        loop, _bus = _make_loop(exec_config=ExecToolConfig(enable=False))
+        loop, _bus = _make_loop(tmp_path, exec_config=ExecToolConfig(enable=False))
 
         assert loop.tools.get("exec") is None
 
     @pytest.mark.asyncio
-    async def test_dispatch_processes_and_publishes(self):
+    async def test_dispatch_processes_and_publishes(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="hello")
         loop._process_message = AsyncMock(
             return_value=OutboundMessage(channel="test", chat_id="c1", content="hi")
@@ -122,10 +121,10 @@ class TestDispatch:
         assert out.content == "hi"
 
     @pytest.mark.asyncio
-    async def test_cli_dispatch_marks_only_the_final_response_as_turn_complete(self):
+    async def test_cli_dispatch_marks_only_the_final_response_as_turn_complete(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="cli", sender_id="u1", chat_id="marketing", content="hello")
         loop._process_message = AsyncMock(
             return_value=OutboundMessage(channel="cli", chat_id="marketing", content="hi")
@@ -138,10 +137,10 @@ class TestDispatch:
         assert out.metadata["_cli_turn_complete"] is True
 
     @pytest.mark.asyncio
-    async def test_cli_dispatch_publishes_empty_completion_after_message_tool_delivery(self):
+    async def test_cli_dispatch_publishes_empty_completion_after_message_tool_delivery(self, tmp_path):
         from nanobot.bus.events import InboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="cli", sender_id="u1", chat_id="marketing", content="hello")
         loop._process_message = AsyncMock(return_value=None)
 
@@ -152,10 +151,10 @@ class TestDispatch:
         assert out.metadata["_cli_turn_complete"] is True
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_preserves_message_metadata(self):
+    async def test_dispatch_streaming_preserves_message_metadata(self, tmp_path):
         from nanobot.bus.events import InboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(
             channel="matrix",
             sender_id="u1",
@@ -189,11 +188,11 @@ class TestDispatch:
         assert second.metadata["_stream_end"] is True
 
     @pytest.mark.asyncio
-    async def test_dispatch_suppresses_resuming_stream_when_result_mode(self):
+    async def test_dispatch_suppresses_resuming_stream_when_result_mode(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
         from nanobot.config.schema import ChannelsConfig
 
-        loop, bus = _make_loop(channels_config=ChannelsConfig(task_update_mode="result"))
+        loop, bus = _make_loop(tmp_path, channels_config=ChannelsConfig(task_update_mode="result"))
         msg = InboundMessage(
             channel="telegram",
             sender_id="u1",
@@ -228,11 +227,11 @@ class TestDispatch:
             await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)
 
     @pytest.mark.asyncio
-    async def test_dispatch_defers_terminal_stream_until_completion_in_result_mode(self):
+    async def test_dispatch_defers_terminal_stream_until_completion_in_result_mode(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
         from nanobot.config.schema import ChannelsConfig
 
-        loop, bus = _make_loop(channels_config=ChannelsConfig(task_update_mode="result"))
+        loop, bus = _make_loop(tmp_path, channels_config=ChannelsConfig(task_update_mode="result"))
         msg = InboundMessage(
             channel="matrix",
             sender_id="u1",
@@ -277,11 +276,11 @@ class TestDispatch:
             await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)
 
     @pytest.mark.asyncio
-    async def test_dispatch_approval_response_visible_when_result_mode(self):
+    async def test_dispatch_approval_response_visible_when_result_mode(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
         from nanobot.config.schema import ChannelsConfig
 
-        loop, bus = _make_loop(channels_config=ChannelsConfig(task_update_mode="result"))
+        loop, bus = _make_loop(tmp_path, channels_config=ChannelsConfig(task_update_mode="result"))
         msg = InboundMessage(
             channel="telegram",
             sender_id="u1",
@@ -312,10 +311,10 @@ class TestDispatch:
             await asyncio.wait_for(bus.consume_outbound(), timeout=0.05)
 
     @pytest.mark.asyncio
-    async def test_processing_lock_serializes(self):
+    async def test_processing_lock_serializes(self, tmp_path):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         order = []
 
         async def mock_process(m, **kwargs):

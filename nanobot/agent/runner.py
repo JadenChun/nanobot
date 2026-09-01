@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,9 +11,16 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.message_content import compact_content, content_to_text
 from nanobot.agent.policy import ToolPolicy, ToolPolicyDecision
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.turn import ToolOutcome
 from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.utils.prompt_budget import (
+    PromptBudget,
+    assert_prompt_fits,
+    reduce_messages_to_budget,
+)
 from nanobot.utils.helpers import build_assistant_message, estimate_prompt_tokens_chain
 
 _DEFAULT_MAX_ITERATIONS_MESSAGE = (
@@ -25,53 +33,45 @@ _COMPACTED_PLACEHOLDER = "[compacted to save context]"
 _COMPACTED_HEAD_LINES = 6
 _COMPACTED_TAIL_LINES = 4
 _COMPACTED_MAX_CHARS = 700
+_TERMINAL_TOOL_STOP_REASONS = frozenset({
+    "approval_required",
+    "policy_blocked",
+    "tool_error",
+    "cancelled",
+})
+
+
+@dataclass(slots=True)
+class _ToolBatchResult:
+    """Results from one model tool batch, including its first terminal stop."""
+
+    results: list[Any]
+    events: list[dict[str, str]]
+    fatal_error: BaseException | None = None
+    terminal_outcome: ToolOutcome | None = None
+
+    def __iter__(self):
+        """Keep the historical three-value private helper unpacking intact."""
+        yield self.results
+        yield self.events
+        yield self.fatal_error
 
 
 def _extract_tool_result_text(content: Any) -> str:
     """Best-effort text extraction for compacting tool results."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text)
-        if parts:
-            return "\n".join(parts)
-    if content is None:
-        return ""
-    return str(content)
+    return content_to_text(content)
 
 
 def _compact_tool_result_content(content: Any) -> str:
     """Preserve a small but useful trace of an old tool result."""
-    text = _extract_tool_result_text(content).strip()
-    if not text:
-        return _CLEARED_PLACEHOLDER
-    if text.startswith(_COMPACTED_PLACEHOLDER) or text == _CLEARED_PLACEHOLDER:
-        return text
-
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        lines = [text]
-
-    if len(lines) <= (_COMPACTED_HEAD_LINES + _COMPACTED_TAIL_LINES):
-        snippet = "\n".join(lines)
-    else:
-        snippet = "\n".join([
-            *lines[:_COMPACTED_HEAD_LINES],
-            "...",
-            *lines[-_COMPACTED_TAIL_LINES:],
-        ])
-
-    if len(snippet) > _COMPACTED_MAX_CHARS:
-        head = snippet[: int(_COMPACTED_MAX_CHARS * 0.7)].rstrip()
-        tail = snippet[-int(_COMPACTED_MAX_CHARS * 0.2):].lstrip()
-        snippet = f"{head}\n...\n{tail}"
-
-    return f"{_COMPACTED_PLACEHOLDER}\n{snippet}"
+    return compact_content(
+        content,
+        compacted_placeholder=_COMPACTED_PLACEHOLDER,
+        cleared_placeholder=_CLEARED_PLACEHOLDER,
+        head_lines=_COMPACTED_HEAD_LINES,
+        tail_lines=_COMPACTED_TAIL_LINES,
+        max_chars=_COMPACTED_MAX_CHARS,
+    )
 
 
 def clear_old_tool_results(
@@ -173,6 +173,10 @@ class AgentRunSpec:
     # for mid-loop context enforcement instead of the scattered tool result
     # clearing and turn trimming logic.
     budget_manager: Any | None = None
+    # Explicit per-request budget for delegated callers.  Main-agent callers
+    # normally provide ``budget_manager``; this field keeps auxiliary runners
+    # on the same final provider-boundary invariant.
+    prompt_budget: PromptBudget | None = None
 
 
 @dataclass(slots=True)
@@ -214,6 +218,18 @@ class AgentRunner:
         if result is None:
             return "ok", "(empty)"
 
+        if isinstance(result, dict):
+            err = result.get("error")
+            if err:
+                return "error", cls._truncate_detail(content_to_text(err))
+            exit_code = result.get("exitCode")
+            if isinstance(exit_code, int) and exit_code != 0:
+                stderr = result.get("stderr")
+                if isinstance(stderr, str) and stderr.strip():
+                    first = stderr.strip().splitlines()[0]
+                    return "error", cls._truncate_detail(f"exitCode {exit_code}: {first}")
+                return "error", f"exitCode {exit_code}"
+
         if isinstance(result, str):
             text = result.strip()
             if text.startswith("Error"):
@@ -241,212 +257,344 @@ class AgentRunner:
                         return "error", cls._truncate_detail(f"exitCode {exit_code}: {first}")
                     return "error", f"exitCode {exit_code}"
 
-        return "ok", cls._truncate_detail(str(result))
+        return "ok", cls._truncate_detail(content_to_text(result) or "(empty)")
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
-        messages = list(spec.initial_messages)
+        # Request-local reductions and runner appends must never mutate the
+        # caller's persisted/session-owned dictionaries.
+        messages = copy.deepcopy(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
-        stream_waiting_final_end = False
+        latest_context: AgentHookContext | None = None
+        terminal_stream_end_emitted = False
 
-        for iteration in range(spec.max_iterations):
-            # Mid-loop context enforcement
-            if iteration > 0:
+        async def emit_terminal_stream_end() -> None:
+            """Close the run's stream exactly once, including on exceptions."""
+            nonlocal terminal_stream_end_emitted
+            if terminal_stream_end_emitted or not hook.wants_streaming():
+                return
+            terminal_stream_end_emitted = True
+            context = latest_context or AgentHookContext(
+                iteration=0,
+                messages=messages,
+            )
+            await hook.on_stream_end(context, resuming=False)
+
+        def provider_error_result(exc: Exception, context: AgentHookContext) -> AgentRunResult:
+            """Normalize provider failures while preserving hook failures."""
+            provider_error = f"Error: {type(exc).__name__}: {exc}"
+            context_error_content = spec.error_message or _DEFAULT_ERROR_MESSAGE
+            context.final_content = context_error_content
+            context.error = provider_error
+            context.stop_reason = "error"
+            return AgentRunResult(
+                final_content=context_error_content,
+                messages=messages,
+                tools_used=tools_used,
+                usage=usage,
+                stop_reason="error",
+                error=provider_error,
+                tool_events=tool_events,
+            )
+
+        try:
+            for iteration in range(spec.max_iterations):
+                # Mid-loop context enforcement
+                if iteration > 0:
+                    if spec.budget_manager is not None:
+                        # Unified context model: use budget manager for all enforcement
+                        await spec.budget_manager.enforce_budget(messages)
+                    else:
+                        # Legacy model: scattered trimming
+                        # Hard ceiling: drop the oldest assistant+tool turn pairs if the
+                        # accumulated context exceeds max_input_tokens.  Run this BEFORE
+                        # clear_old_tool_results so we don't waste effort clearing
+                        # messages that are about to be deleted.
+                        if spec.max_input_tokens and spec.max_input_tokens > 0:
+                            self._trim_context_to_budget(
+                                messages,
+                                spec=spec,
+                            )
+
+                        # Clear old tool results each iteration to prevent context overflow
+                        # during long-running tasks, but only once prompt size actually needs it.
+                        if spec.tool_result_clearing_keep is not None:
+                            clear_old_tool_results(
+                                messages,
+                                keep_last=spec.tool_result_clearing_keep,
+                                provider=self.provider,
+                                model=spec.model,
+                                tools=spec.tools.get_definitions(),
+                                trigger_tokens=spec.tool_result_clear_trigger_tokens,
+                                target_tokens=spec.tool_result_clear_target_tokens,
+                            )
+
+                context = AgentHookContext(iteration=iteration, messages=messages)
+                latest_context = context
+                await hook.before_iteration(context)
+
+                # Final request-local reduction and hard preflight happen
+                # after all hooks, immediately before provider transport.  A
+                # provider-boundary check below is still applied by the base
+                # provider as defense in depth.
+                budget = spec.prompt_budget
+                if budget is None and spec.budget_manager is not None:
+                    budget = getattr(spec.budget_manager.budget, "prompt_budget", None)
+                if budget is None:
+                    total = spec.max_input_tokens
+                    if not isinstance(total, int) or total <= 0:
+                        total = getattr(
+                            getattr(self.provider, "generation", None),
+                            "context_window_tokens",
+                            0,
+                        )
+                    if isinstance(total, int) and total > 0:
+                        reserve = spec.max_tokens
+                        if reserve is None:
+                            reserve = getattr(
+                                getattr(self.provider, "generation", None),
+                                "max_tokens",
+                                0,
+                            )
+                        budget = PromptBudget(
+                            total_tokens=total,
+                            completion_reserve=int(reserve or 0),
+                        )
+
                 if spec.budget_manager is not None:
-                    # Unified context model: use budget manager for all enforcement
-                    await spec.budget_manager.enforce_budget(messages)
+                    await spec.budget_manager.enforce_budget(
+                        messages,
+                        preserve_last_n_turns=spec.tool_result_clearing_keep or 2,
+                    )
+                elif budget is not None:
+                    messages[:] = reduce_messages_to_budget(
+                        messages,
+                        self.provider,
+                        spec.model,
+                        spec.tools.get_definitions(),
+                        budget,
+                        preserve_last_n_turns=spec.tool_result_clearing_keep or 2,
+                    )
+                context.messages = messages
+                kwargs: dict[str, Any] = {
+                    "messages": messages,
+                    "tools": spec.tools.get_definitions(),
+                    "model": spec.model,
+                }
+                if spec.temperature is not None:
+                    kwargs["temperature"] = spec.temperature
+                if spec.max_tokens is not None:
+                    kwargs["max_tokens"] = spec.max_tokens
+                if spec.reasoning_effort is not None:
+                    kwargs["reasoning_effort"] = spec.reasoning_effort
+
+                if budget is not None:
+                    assert_prompt_fits(
+                        self.provider,
+                        spec.model,
+                        messages,
+                        spec.tools.get_definitions(),
+                        budget,
+                    )
+
+                if hook.wants_streaming():
+                    async def _stream(delta: str) -> None:
+                        await hook.on_stream(context, delta)
+
+                    try:
+                        response = await self.provider.chat_stream_with_retry(
+                            **kwargs,
+                            on_content_delta=_stream,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        return provider_error_result(exc, context)
                 else:
-                    # Legacy model: scattered trimming
-                    # Hard ceiling: drop the oldest assistant+tool turn pairs if the
-                    # accumulated context exceeds max_input_tokens.  Run this BEFORE
-                    # clear_old_tool_results so we don't waste effort clearing
-                    # messages that are about to be deleted.
-                    if spec.max_input_tokens and spec.max_input_tokens > 0:
-                        self._trim_context_to_budget(
-                            messages,
-                            spec=spec,
+                    try:
+                        response = await self.provider.chat_with_retry(**kwargs)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        return provider_error_result(exc, context)
+
+                raw_usage = response.usage or {}
+                usage = {
+                    "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
+                }
+                context.response = response
+                context.usage = usage
+                context.tool_calls = list(response.tool_calls)
+
+                if response.has_tool_calls:
+                    decision = await self._evaluate_tool_policy(spec, context, response.tool_calls)
+                    if decision.action != "allow":
+                        stop_reason = decision.stop_reason or "policy_blocked"
+                        final_content = decision.response
+                        proposed_approach = hook.finalize_content(context, response.content)
+                        if (
+                            (
+                                getattr(decision, "requires_approval", False)
+                                or stop_reason == "approval_required"
+                            )
+                            and isinstance(final_content, str)
+                            and proposed_approach
+                            and proposed_approach.strip()
+                            and proposed_approach.strip() not in final_content
+                        ):
+                            final_content = (
+                                f"{final_content}\n\n"
+                                f"Proposed approach before approval:\n{proposed_approach.strip()}"
+                            )
+                        messages.append(build_assistant_message(
+                            final_content,
+                            reasoning_content=response.reasoning_content,
+                            thinking_blocks=response.thinking_blocks,
+                            image_calls=response.image_calls,
+                        ))
+                        context.final_content = final_content
+                        context.stop_reason = stop_reason
+                        await hook.after_iteration(context)
+                        return AgentRunResult(
+                            final_content=final_content,
+                            messages=messages,
+                            tools_used=tools_used,
+                            usage=usage,
+                            stop_reason=stop_reason,
+                            error=error,
+                            tool_events=tool_events,
+                            policy_metadata=decision.metadata,
                         )
 
-                    # Clear old tool results each iteration to prevent context overflow
-                    # during long-running tasks, but only once prompt size actually needs it.
-                    if spec.tool_result_clearing_keep is not None:
-                        clear_old_tool_results(
-                            messages,
-                            keep_last=spec.tool_result_clearing_keep,
-                            provider=self.provider,
-                            model=spec.model,
-                            tools=spec.tools.get_definitions(),
-                            trigger_tokens=spec.tool_result_clear_trigger_tokens,
-                            target_tokens=spec.tool_result_clear_target_tokens,
-                        )
+                    if hook.wants_streaming():
+                        # This is an intermediate segment.  The terminal segment
+                        # is emitted by the common finalizer below.
+                        await hook.on_stream_end(context, resuming=True)
 
-            context = AgentHookContext(iteration=iteration, messages=messages)
-            await hook.before_iteration(context)
-            kwargs: dict[str, Any] = {
-                "messages": messages,
-                "tools": spec.tools.get_definitions(),
-                "model": spec.model,
-            }
-            if spec.temperature is not None:
-                kwargs["temperature"] = spec.temperature
-            if spec.max_tokens is not None:
-                kwargs["max_tokens"] = spec.max_tokens
-            if spec.reasoning_effort is not None:
-                kwargs["reasoning_effort"] = spec.reasoning_effort
-
-            if hook.wants_streaming():
-                async def _stream(delta: str) -> None:
-                    await hook.on_stream(context, delta)
-
-                response = await self.provider.chat_stream_with_retry(
-                    **kwargs,
-                    on_content_delta=_stream,
-                )
-            else:
-                response = await self.provider.chat_with_retry(**kwargs)
-
-            raw_usage = response.usage or {}
-            usage = {
-                "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
-            }
-            context.response = response
-            context.usage = usage
-            context.tool_calls = list(response.tool_calls)
-
-            if response.has_tool_calls:
-                decision = await self._evaluate_tool_policy(spec, context, response.tool_calls)
-                if decision.action != "allow":
-                    final_content = decision.response
-                    proposed_approach = hook.finalize_content(context, response.content)
-                    if (
-                        isinstance(final_content, str)
-                        and proposed_approach
-                        and proposed_approach.strip()
-                        and proposed_approach.strip() not in final_content
-                    ):
-                        final_content = (
-                            f"{final_content}\n\n"
-                            f"Proposed approach before approval:\n{proposed_approach.strip()}"
-                        )
-                    stop_reason = decision.stop_reason or "policy_blocked"
                     messages.append(build_assistant_message(
-                        final_content,
+                        response.content or "",
+                        tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
                         image_calls=response.image_calls,
                     ))
-                    context.final_content = final_content
-                    context.stop_reason = stop_reason
-                    if hook.wants_streaming() and stream_waiting_final_end:
-                        await hook.on_stream_end(context, resuming=False)
-                        stream_waiting_final_end = False
-                    await hook.after_iteration(context)
-                    return AgentRunResult(
-                        final_content=final_content,
-                        messages=messages,
-                        tools_used=tools_used,
-                        usage=usage,
-                        stop_reason=stop_reason,
-                        error=error,
-                        tool_events=tool_events,
-                        policy_metadata=decision.metadata,
-                    )
+                    tools_used.extend(tc.name for tc in response.tool_calls)
 
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=True)
-                    stream_waiting_final_end = True
+                    await hook.before_execute_tools(context)
+
+                    batch = await self._execute_tools(spec, response.tool_calls)
+                    results, new_events, fatal_error = batch
+                    tool_events.extend(new_events)
+                    context.tool_results = list(results)
+                    context.tool_events = list(new_events)
+                    for tool_call, result in zip(response.tool_calls, results):
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        })
+
+                    # A terminal ToolOutcome ends this iteration immediately.
+                    # In the sequential path, _execute_tools has already
+                    # represented every unstarted call as a skipped result, so
+                    # provider history remains a legal assistant/tool pair.
+                    if batch.terminal_outcome is not None:
+                        terminal = batch.terminal_outcome
+                        stop_reason = terminal.stop_reason or "tool_error"
+                        final_content = (
+                            terminal.content
+                            if isinstance(terminal.content, str)
+                            else str(terminal.content or "")
+                        )
+                        context.final_content = final_content
+                        context.stop_reason = stop_reason
+                        if stop_reason == "tool_error":
+                            context.error = final_content
+                        await hook.after_iteration(context)
+                        return AgentRunResult(
+                            final_content=final_content,
+                            messages=messages,
+                            tools_used=tools_used,
+                            usage=usage,
+                            stop_reason=stop_reason,
+                            error=context.error,
+                            tool_events=tool_events,
+                            policy_metadata=dict(terminal.policy_metadata),
+                        )
+                    if fatal_error is not None:
+                        error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
+                        stop_reason = "tool_error"
+                        context.error = error
+                        context.stop_reason = stop_reason
+                        await hook.after_iteration(context)
+                        break
+                    await hook.after_iteration(context)
+                    continue
+
+                clean = hook.finalize_content(context, response.content)
+                if response.finish_reason == "error":
+                    final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+                    stop_reason = "error"
+                    error = final_content
+                    context.final_content = final_content
+                    context.error = error
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
+
+                # If the model returned no visible text (e.g. only <think> blocks stripped)
+                # but has already used tools, nudge it to produce a real response instead of
+                # silently finishing — common with local/reasoning models.
+                if (not clean or not clean.strip()) and tools_used and iteration < spec.max_iterations:
+                    messages.append(build_assistant_message(
+                        "",
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                        image_calls=response.image_calls,
+                    ))
+                    messages.append({
+                        "role": "user",
+                        "content": "Please provide a text response summarizing what you found and accomplished.",
+                    })
+                    await hook.after_iteration(context)
+                    continue
 
                 messages.append(build_assistant_message(
-                    response.content or "",
-                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                    clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                     image_calls=response.image_calls,
                 ))
-                tools_used.extend(tc.name for tc in response.tool_calls)
-
-                await hook.before_execute_tools(context)
-
-                results, new_events, fatal_error = await self._execute_tools(spec, response.tool_calls)
-                tool_events.extend(new_events)
-                context.tool_results = list(results)
-                context.tool_events = list(new_events)
-                if fatal_error is not None:
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    stop_reason = "tool_error"
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    if hook.wants_streaming() and stream_waiting_final_end:
-                        await hook.on_stream_end(context, resuming=False)
-                        stream_waiting_final_end = False
-                    await hook.after_iteration(context)
-                    break
-                for tool_call, result in zip(response.tool_calls, results):
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "content": result,
-                    })
-                await hook.after_iteration(context)
-                continue
-
-            if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=False)
-                stream_waiting_final_end = False
-
-            clean = hook.finalize_content(context, response.content)
-            if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
-                stop_reason = "error"
-                error = final_content
+                final_content = clean
                 context.final_content = final_content
-                context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
                 break
-
-            # If the model returned no visible text (e.g. only <think> blocks stripped)
-            # but has already used tools, nudge it to produce a real response instead of
-            # silently finishing — common with local/reasoning models.
-            if (not clean or not clean.strip()) and tools_used and iteration < spec.max_iterations:
-                messages.append(build_assistant_message(
-                    "",
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                    image_calls=response.image_calls,
-                ))
-                messages.append({
-                    "role": "user",
-                    "content": "Please provide a text response summarizing what you found and accomplished.",
-                })
-                await hook.after_iteration(context)
-                continue
-
-            messages.append(build_assistant_message(
-                clean,
-                reasoning_content=response.reasoning_content,
-                thinking_blocks=response.thinking_blocks,
-                image_calls=response.image_calls,
-            ))
-            final_content = clean
-            context.final_content = final_content
-            context.stop_reason = stop_reason
-            await hook.after_iteration(context)
-            break
-        else:
-            stop_reason = "max_iterations"
-            template = spec.max_iterations_message or _DEFAULT_MAX_ITERATIONS_MESSAGE
-            final_content = template.format(max_iterations=spec.max_iterations)
-            if hook.wants_streaming() and stream_waiting_final_end:
-                end_context = AgentHookContext(iteration=spec.max_iterations, messages=messages)
-                await hook.on_stream_end(end_context, resuming=False)
+            else:
+                stop_reason = "max_iterations"
+                template = spec.max_iterations_message or _DEFAULT_MAX_ITERATIONS_MESSAGE
+                final_content = template.format(max_iterations=spec.max_iterations)
+        except asyncio.CancelledError:
+            # Child tools own their process cleanup; preserve cancellation after
+            # the stream finalizer in ``finally`` has closed the visible stream.
+            raise
+        finally:
+            if hook.wants_streaming():
+                try:
+                    await emit_terminal_stream_end()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A failing stream sink must not prevent the runner from
+                    # returning its completed/error result.
+                    logger.exception("Agent stream finalizer failed")
 
         return AgentRunResult(
             final_content=final_content,
@@ -473,40 +621,132 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
-    ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+    ) -> _ToolBatchResult:
         should_run_concurrently = spec.concurrent_tools and all(
             (tool is None or tool.supports_parallel_calls)
             for tool in (spec.tools.get(tool_call.name) for tool_call in tool_calls)
         )
 
         if should_run_concurrently:
-            tool_results = await asyncio.gather(*(
+            raw_results = await asyncio.gather(*(
                 self._run_tool(spec, tool_call)
                 for tool_call in tool_calls
             ))
         else:
-            tool_results = [
-                await self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
-            ]
+            raw_results = []
+            for tool_call in tool_calls:
+                raw_result = await self._run_tool(spec, tool_call)
+                raw_results.append(raw_result)
+                execution = self._normalize_tool_execution(raw_result)
+                if execution[3] is not None or execution[2] is not None:
+                    # A terminal outcome/error must prevent every later
+                    # sequential call from starting.  Fill the result list
+                    # with explicit skipped entries so the provider sees a
+                    # result for each assistant tool_call id.
+                    results = [
+                        self._normalize_tool_execution(item)[0]
+                        for item in raw_results
+                    ]
+                    events = [
+                        self._normalize_tool_execution(item)[1]
+                        for item in raw_results
+                    ]
+                    terminal = execution[3]
+                    fatal_error = execution[2]
+                    if terminal is None and fatal_error is not None:
+                        terminal = ToolOutcome(
+                            content=f"Error: {type(fatal_error).__name__}: {fatal_error}",
+                            stop_reason="tool_error",
+                        )
+                    for skipped_call in tool_calls[len(raw_results):]:
+                        skipped_detail = (
+                            f"Skipped: not executed after terminal {terminal.stop_reason}"
+                            if terminal is not None
+                            else "Skipped: not executed after a tool error"
+                        )
+                        results.append(skipped_detail)
+                        events.append({
+                            "name": skipped_call.name,
+                            "status": "skipped",
+                            "detail": skipped_detail,
+                            "tool_call_id": skipped_call.id,
+                        })
+                    return _ToolBatchResult(
+                        results=results,
+                        events=events,
+                        fatal_error=None if terminal is not None else fatal_error,
+                        terminal_outcome=terminal,
+                    )
+
+            # No terminal result occurred in the sequential path.
+            tool_results = raw_results
+
+        # Concurrent calls have all been launched by this point.  We still
+        # preserve the first terminal outcome in model order, but cannot claim
+        # that later calls were prevented from running.
+        tool_results = raw_results
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
         fatal_error: BaseException | None = None
-        for result, event, error in tool_results:
+        terminal_outcome: ToolOutcome | None = None
+        for raw_result in tool_results:
+            result, event, error, outcome = self._normalize_tool_execution(raw_result)
             results.append(result)
             events.append(event)
+            if outcome is None and error is not None:
+                outcome = ToolOutcome(
+                    content=f"Error: {type(error).__name__}: {error}",
+                    stop_reason="tool_error",
+                )
+            if terminal_outcome is None and outcome is not None:
+                terminal_outcome = outcome
             if error is not None and fatal_error is None:
                 fatal_error = error
-        return results, events, fatal_error
+        if terminal_outcome is None and fatal_error is not None:
+            terminal_outcome = ToolOutcome(
+                content=f"Error: {type(fatal_error).__name__}: {fatal_error}",
+                stop_reason="tool_error",
+            )
+        return _ToolBatchResult(
+            results=results,
+            events=events,
+            fatal_error=fatal_error if terminal_outcome is None else None,
+            terminal_outcome=terminal_outcome,
+        )
+
+    @staticmethod
+    def _normalize_tool_execution(
+        raw_result: tuple[Any, ...],
+    ) -> tuple[Any, dict[str, str], BaseException | None, ToolOutcome | None]:
+        """Normalize current and legacy _run_tool return shapes."""
+        if len(raw_result) == 4:
+            result, event, error, outcome = raw_result
+            if isinstance(outcome, ToolOutcome):
+                result = outcome.content
+                if outcome.stop_reason in _TERMINAL_TOOL_STOP_REASONS:
+                    return result, {
+                        **event,
+                        "status": outcome.stop_reason,
+                    }, error, outcome
+            return result, event, error, None
+        result, event, error = raw_result
+        if isinstance(result, ToolOutcome):
+            return result.content, {
+                **event,
+                "status": result.stop_reason or event.get("status", "ok"),
+            }, error, (
+                result if result.stop_reason in _TERMINAL_TOOL_STOP_REASONS else None
+            )
+        return result, event, error, None
 
     async def _run_tool(
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
-    ) -> tuple[Any, dict[str, str], BaseException | None]:
+    ) -> tuple[Any, dict[str, str], BaseException | None, ToolOutcome | None]:
         try:
-            result = await spec.tools.execute(tool_call.name, tool_call.arguments)
+            raw_result = await spec.tools.execute(tool_call.name, tool_call.arguments)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -516,15 +756,24 @@ class AgentRunner:
                 "detail": str(exc),
             }
             if spec.fail_on_tool_error:
-                return f"Error: {type(exc).__name__}: {exc}", event, exc
-            return f"Error: {type(exc).__name__}: {exc}", event, None
+                return f"Error: {type(exc).__name__}: {exc}", event, exc, None
+            return f"Error: {type(exc).__name__}: {exc}", event, None, None
+
+        outcome = raw_result if isinstance(raw_result, ToolOutcome) else None
+        result = outcome.content if outcome is not None else raw_result
+        if outcome is not None and outcome.stop_reason in _TERMINAL_TOOL_STOP_REASONS:
+            return result, {
+                "name": tool_call.name,
+                "status": outcome.stop_reason,
+                "detail": self._truncate_detail(content_to_text(result) or "(empty)"),
+            }, None, outcome
 
         status, detail = self._summarize_tool_result(result)
         return result, {
             "name": tool_call.name,
             "status": status,
             "detail": detail,
-        }, None
+        }, None, None
 
     def _trim_context_to_budget(
         self,

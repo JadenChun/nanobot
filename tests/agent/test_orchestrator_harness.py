@@ -178,15 +178,13 @@ async def test_worker_is_foreground_scoped_and_sequential(tmp_path) -> None:
     assert spec.tools.get("delegate_task") is None
 
 
-def test_delegated_shell_allowlist_rejects_chained_commands(tmp_path) -> None:
+def test_delegated_read_only_roles_have_no_shell_tool(tmp_path) -> None:
     manager = ForegroundAgentManager(provider=_provider(), workspace=tmp_path)
-    exec_tool = manager._read_only_tools().get("exec")
 
-    assert exec_tool is not None
-    assert exec_tool._guard_command("git status", str(tmp_path)) is None
-    assert "not in allowlist" in exec_tool._guard_command(
-        "git status; Remove-Item report.docx",
-        str(tmp_path),
+    assert manager._read_only_tools().get("exec") is None
+    assert all(
+        manager._tools_for_role(role).get("exec") is None
+        for role in ("planner", "reviewer", "explorer", "crawler")
     )
 
 

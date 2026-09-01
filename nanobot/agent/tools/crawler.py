@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import ToolOutcome, TurnContext
 
 if TYPE_CHECKING:
     from nanobot.agent.delegation import ForegroundAgentManager
@@ -44,8 +45,14 @@ class CrawlResearchTool(Tool):
             "additionalProperties": False,
         }
 
-    async def execute(self, task: str, **_: Any) -> str:
+    async def execute(self, task: str, **_: Any) -> str | ToolOutcome:
         return await self._manager.run_crawler(task=task)
+
+    async def execute_with_context(self, context: TurnContext, **kwargs: Any) -> Any:
+        return await self._manager.run_crawler(
+            task=kwargs.get("task", ""),
+            turn_context=context,
+        )
 
 
 __all__ = ["CrawlResearchTool"]

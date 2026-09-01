@@ -3,6 +3,7 @@
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.turn import ToolOutcome, TurnContext
 from nanobot.bus.events import OutboundMessage
 
 
@@ -120,3 +121,59 @@ class MessageTool(Tool):
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+    async def execute_with_context(
+        self,
+        context: TurnContext,
+        content: str,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        message_id: str | None = None,
+        media: list[str] | None = None,
+        **kwargs: Any,
+    ) -> ToolOutcome:
+        """Send through the current turn's delivery state.
+
+        The shared ``MessageTool`` instance is retained for compatibility with
+        older callers, but canonical turns never mutate its routing or sent
+        ledger.  Every value used for routing and suppression comes from the
+        explicit context passed by the turn registry.
+        """
+        target = context.delivery.primary or context.delivery.target
+        channel = channel or (target.channel if target else "")
+        chat_id = chat_id or (
+            target.chat_id or target.to or target.recipient if target else ""
+        )
+        message_id = message_id or (target.message_id if target else None)
+
+        if not channel or not chat_id:
+            return ToolOutcome(content="Error: No target channel/chat specified")
+        if not self._send_callback:
+            return ToolOutcome(content="Error: Message sending not configured")
+
+        msg = OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
+            metadata={"message_id": message_id},
+        )
+        try:
+            await self._send_callback(msg)
+        except Exception as exc:
+            return ToolOutcome(content=f"Error sending message: {exc}")
+
+        context.delivery.sent_messages.append(msg)
+        primary = context.delivery.primary or context.delivery.target
+        if primary is not None:
+            primary_chat = primary.chat_id or primary.to or primary.recipient
+            if channel == primary.channel and chat_id == primary_chat:
+                context.delivery.delivered = True
+                context.delivery.message_id = message_id
+        return ToolOutcome(
+            content=(
+                f"Message sent to {channel}:{chat_id}"
+                f" with {len(media)} attachments" if media
+                else f"Message sent to {channel}:{chat_id}"
+            )
+        )

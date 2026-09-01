@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import re
 import uuid
@@ -12,21 +13,29 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.capabilities import DELEGATED_READ_ONLY_ROLES, role_capabilities
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.policy import DelegatedReadOnlyPolicy
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.agent.tools.agent_browser import AgentBrowserTool
 from nanobot.agent.tools.agent_device import AgentDeviceTool
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+)
 from nanobot.agent.tools.mcp import connect_mcp_servers, is_read_only_mcp_tool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.social_crawl import (
     SocialCrawlTool,
     authenticated_crawl_enabled,
     crawl_tools_enabled,
 )
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.turn import DelegationBudget, ToolOutcome, TurnContext
 from nanobot.agent.write_guard import FileLockRegistry, WriteScope
 from nanobot.config.schema import (
     AgentBrowserConfig,
@@ -37,25 +46,27 @@ from nanobot.config.schema import (
 from nanobot.context_repo import ContextRepoManager, ResourceAccessPolicy
 from nanobot.providers.base import LLMProvider
 
-_SAFE_COMMAND = r"^(?!.*(?:[;&|`<>]|\$\())\s*"
-_SAFE_ARGUMENTS = r"(?:\s+[^\r\n;&|`<>]*)?\s*$"
+# Legacy explore/crawler tools call the manager directly.  Keep their bridge
+# task-local so concurrent canonical turns cannot share routing or budgets.
+_CURRENT_TURN_CONTEXT: contextvars.ContextVar[TurnContext | None] = contextvars.ContextVar(
+    "nanobot_foreground_turn_context",
+    default=None,
+)
 
-_READ_ONLY_EXEC_ALLOW_PATTERNS = [
-    _SAFE_COMMAND + r"(?:Get-ChildItem|ls|dir|pwd|Get-Location)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"(?:Get-Content|type|cat)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"(?:Select-String|findstr|grep|rg)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"(?:head|tail)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"sed\s+-n" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"git\s+(?:status|diff|show|log|grep|branch)" + _SAFE_ARGUMENTS,
-]
 
-_WORKER_EXEC_ALLOW_PATTERNS = [
-    *_READ_ONLY_EXEC_ALLOW_PATTERNS,
-    _SAFE_COMMAND + r"(?:python\s+-m\s+pytest|pytest)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"(?:python\s+-m\s+ruff|ruff)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"uv\s+run\s+(?:pytest|ruff)" + _SAFE_ARGUMENTS,
-    _SAFE_COMMAND + r"(?:npm|pnpm|yarn|bun)\s+(?:test|lint|check)" + _SAFE_ARGUMENTS,
-]
+def set_current_turn_context(context: TurnContext) -> contextvars.Token:
+    """Bind a turn context for legacy foreground tools in this task."""
+    return _CURRENT_TURN_CONTEXT.set(context)
+
+
+def reset_current_turn_context(token: contextvars.Token) -> None:
+    """Restore the previous task-local foreground context."""
+    _CURRENT_TURN_CONTEXT.reset(token)
+
+
+def current_turn_context() -> TurnContext | None:
+    """Return the task-local turn context, if one is active."""
+    return _CURRENT_TURN_CONTEXT.get()
 
 
 class _DelegationHook(AgentHook):
@@ -113,7 +124,9 @@ class ForegroundAgentManager:
         self.web_proxy = web_proxy
         self.agent_browser_config = agent_browser_config or AgentBrowserConfig()
         self.agent_device_config = agent_device_config or AgentDeviceConfig()
-        self.exec_config = exec_config or ExecToolConfig()
+        # Kept in the constructor for configuration compatibility; delegated
+        # roles intentionally never register or invoke the shell tool.
+        _ = exec_config
         self.context_manager = context_manager or ContextRepoManager.from_config(
             context_paths=context_paths
         )
@@ -141,28 +154,54 @@ class ForegroundAgentManager:
         self._crawler_gate = asyncio.Semaphore(1)
         self._max_calls_per_turn = max(1, max_calls_per_turn)
         self._max_worker_calls_per_turn = max(1, max_worker_calls_per_turn)
-        self._calls_this_turn = 0
-        self._worker_calls_this_turn = 0
+        self._legacy_budget: contextvars.ContextVar[DelegationBudget | None] = contextvars.ContextVar(
+            f"{self.__class__.__name__}_legacy_budget",
+            default=None,
+        )
 
     def start_turn(self) -> None:
-        """Reset the bounded delegation budget for a new main-agent turn."""
-        self._calls_this_turn = 0
-        self._worker_calls_this_turn = 0
+        """Reset the compatibility budget in the current task.
 
-    def _consume_call(self, role: str) -> str | None:
-        if self._calls_this_turn >= self._max_calls_per_turn:
-            return (
-                "Error: foreground delegation limit reached for this turn. "
-                "Use the evidence already gathered or explain what remains blocked."
-            )
-        if role == "worker" and self._worker_calls_this_turn >= self._max_worker_calls_per_turn:
+        Canonical turns carry their budget in :class:`TurnContext`; this method
+        remains only for older direct manager callers.
+        """
+        self._legacy_budget.set(self.new_budget())
+
+    def new_budget(self) -> DelegationBudget:
+        """Create a budget using this manager's configured role limits."""
+        return DelegationBudget(
+            max_calls=self._max_calls_per_turn,
+            max_worker_corrections=self._max_worker_calls_per_turn,
+        )
+
+    def _consume_call(
+        self,
+        role: str,
+        turn_context: TurnContext | None = None,
+    ) -> str | None:
+        context = turn_context or current_turn_context()
+        if context is not None:
+            budget = context.delegation_budget
+        else:
+            budget = self._legacy_budget.get()
+            if budget is None:
+                self.start_turn()
+                budget = self._legacy_budget.get()
+            assert budget is not None
+
+        if role == "worker" and budget.worker_corrections_remaining <= 0:
             return (
                 "Error: foreground worker correction limit reached for this turn. "
                 "Stop revising and report the remaining issue."
             )
-        self._calls_this_turn += 1
+        if budget.calls_remaining <= 0:
+            return (
+                "Error: foreground delegation limit reached for this turn. "
+                "Use the evidence already gathered or explain what remains blocked."
+            )
+        budget.consume_call()
         if role == "worker":
-            self._worker_calls_this_turn += 1
+            budget.consume_worker_correction()
         return None
 
     def _context_skill_paths(self) -> list[Path]:
@@ -239,10 +278,71 @@ class ForegroundAgentManager:
         finally:
             self._mcp_connecting = False
 
-    def _read_only_tools(self) -> ToolRegistry:
+    def _tools_for_role(self, role: str) -> ToolRegistry:
+        """Build a fresh registry from the immutable role capability profile."""
+        profile = role_capabilities(role)
+        if profile.role == "worker":
+            raise ValueError("worker tools require an explicit write scope")
+
+        tools = ToolRegistry()
+        if profile.role == "crawler":
+            tools.register(SocialCrawlTool())
+            return tools
+
+        allowed_dir = self.workspace if self.restrict_to_workspace else None
+        extra_read = self._extra_read_dirs(allowed_dir)
+        fs_kwargs = {
+            "workspace": self.workspace,
+            "allowed_dir": allowed_dir,
+            "extra_allowed_dirs": extra_read,
+            "resource_policy": self.resource_policy,
+        }
+        tools.register(ReadFileTool(**fs_kwargs))
+        tools.register(ListDirTool(**fs_kwargs))
+        tools.register(SearchFilesTool(**fs_kwargs))
+        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+        tools.register(WebFetchTool(proxy=self.web_proxy))
+
+        if "agent_browser" in profile.tools and self.agent_browser_config.enabled:
+            tools.register(AgentBrowserTool(
+                package=self.agent_browser_config.package,
+                timeout=self.agent_browser_config.timeout,
+                max_output_chars=self.agent_browser_config.max_output_chars,
+                working_dir=str(self.workspace),
+                read_only=True,
+            ))
+        if "agent_device" in profile.tools and self.agent_device_config.enabled:
+            tools.register(AgentDeviceTool(
+                package=self.agent_device_config.package,
+                timeout=self.agent_device_config.timeout,
+                max_output_chars=self.agent_device_config.max_output_chars,
+                working_dir=str(self.workspace),
+                read_only=True,
+            ))
+        if profile.allow_read_only_mcp:
+            for tool in self._read_only_mcp_tools.iter_tools():
+                if is_read_only_mcp_tool(tool):
+                    tools.register(tool)
+        return tools
+
+    def _read_only_tools(self, role: str = "planner") -> ToolRegistry:
+        """Compatibility alias for callers that need a specific read-only role."""
+        if role not in DELEGATED_READ_ONLY_ROLES:
+            raise ValueError(f"unknown read-only delegated role: {role!r}")
+        return self._tools_for_role(role)
+
+    # Public spelling useful to tests/integrations while role-specific callers
+    # continue to use the private compatibility alias above.
+    tools_for_role = _tools_for_role
+
+    def _worker_tools(self, call_id: str, scopes: tuple[WriteScope, ...]) -> ToolRegistry:
+        # Workers receive only file inspection and scoped file mutation.  Do
+        # not inherit shell, browser, device, web, MCP, message, cron, or
+        # delegation capabilities from the main/role registries.
         tools = ToolRegistry()
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = self._extra_read_dirs(allowed_dir)
+        extra_write = self._extra_write_dirs(allowed_dir)
         tools.register(ReadFileTool(
             workspace=self.workspace,
             allowed_dir=allowed_dir,
@@ -255,40 +355,6 @@ class ForegroundAgentManager:
             extra_allowed_dirs=extra_read,
             resource_policy=self.resource_policy,
         ))
-        if self.exec_config.enable:
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                allow_patterns=_READ_ONLY_EXEC_ALLOW_PATTERNS,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-                resource_policy=self.resource_policy,
-            ))
-        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-        tools.register(WebFetchTool(proxy=self.web_proxy))
-        if self.agent_browser_config.enabled:
-            tools.register(AgentBrowserTool(
-                package=self.agent_browser_config.package,
-                timeout=self.agent_browser_config.timeout,
-                max_output_chars=self.agent_browser_config.max_output_chars,
-                working_dir=str(self.workspace),
-            ))
-        if self.agent_device_config.enabled:
-            tools.register(AgentDeviceTool(
-                package=self.agent_device_config.package,
-                timeout=self.agent_device_config.timeout,
-                max_output_chars=self.agent_device_config.max_output_chars,
-                working_dir=str(self.workspace),
-            ))
-        for tool in self._read_only_mcp_tools.iter_tools():
-            if is_read_only_mcp_tool(tool):
-                tools.register(tool)
-        return tools
-
-    def _worker_tools(self, call_id: str, scopes: tuple[WriteScope, ...]) -> ToolRegistry:
-        tools = self._read_only_tools()
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        extra_write = self._extra_write_dirs(allowed_dir)
         lock_owner = f"foreground-worker:{call_id}"
         tools.register(WriteFileTool(
             workspace=self.workspace,
@@ -308,15 +374,6 @@ class ForegroundAgentManager:
             lock_owner=lock_owner,
             allowed_write_scope=list(scopes),
         ))
-        if self.exec_config.enable:
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                allow_patterns=_WORKER_EXEC_ALLOW_PATTERNS,
-                restrict_to_workspace=True,
-                path_append=self.exec_config.path_append,
-                resource_policy=self.resource_policy,
-            ))
         return tools
 
     @staticmethod
@@ -338,9 +395,21 @@ class ForegroundAgentManager:
         max_input_tokens: int | None = None,
         max_output_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        turn_context: TurnContext | None = None,
     ) -> AgentRunResult:
         call_id = str(uuid.uuid4())[:8]
         logger.info("Foreground {} [{}] started", role, call_id)
+        if role in DELEGATED_READ_ONLY_ROLES:
+            profile = role_capabilities(role)
+            capability_prompt = (
+                "\n\n## Enforced capability boundary\n"
+                f"Role `{profile.role}` may call only the tools in this registry: "
+                f"{', '.join(tools.tool_names) or '(none)'}. "
+                "The complete tool batch is checked before execution; state-changing or "
+                "unknown browser/device/crawler actions are blocked and cannot be elevated "
+                "by parent approval."
+            )
+            prompt = prompt + capability_prompt
         result = await (runner or self.runner).run(AgentRunSpec(
             initial_messages=[
                 {"role": "system", "content": prompt},
@@ -355,6 +424,14 @@ class ForegroundAgentManager:
             hook=_DelegationHook(role, call_id),
             concurrent_tools=role in {"planner", "reviewer", "explorer"},
             fail_on_tool_error=True,
+            tool_policy=(
+                DelegatedReadOnlyPolicy(
+                    allowed_tools=tools.tool_names,
+                    role=role,
+                )
+                if role in DELEGATED_READ_ONLY_ROLES
+                else None
+            ),
         ))
         logger.info("Foreground {} [{}] completed with {}", role, call_id, result.stop_reason)
         return result
@@ -371,8 +448,40 @@ class ForegroundAgentManager:
             return f"Error: {role} reached its iteration limit without a final result."
         return f"Error: {role} completed without returning a result."
 
-    async def run_plan(self, *, objective: str, context: str = "") -> str:
-        if error := self._consume_call("planner"):
+    @classmethod
+    def _role_result(
+        cls,
+        result: AgentRunResult,
+        role: str,
+        turn_context: TurnContext | None,
+    ) -> str | ToolOutcome:
+        """Keep nested terminal metadata attached for contextual outer turns."""
+        content = cls._result_text(result, role)
+        if (
+            turn_context is not None
+            and result.stop_reason in {
+                "policy_blocked",
+                "approval_required",
+                "tool_error",
+                "cancelled",
+            }
+        ):
+            return ToolOutcome(
+                content=content,
+                stop_reason=result.stop_reason,
+                policy_metadata=dict(result.policy_metadata),
+            )
+        return content
+
+    async def run_plan(
+        self,
+        *,
+        objective: str,
+        context: str = "",
+        turn_context: TurnContext | None = None,
+    ) -> str | ToolOutcome:
+        turn_context = turn_context or current_turn_context()
+        if error := self._consume_call("planner", turn_context):
             return error
         await self._connect_read_only_mcp()
         prompt = self._base_prompt("Planning Role") + """
@@ -388,19 +497,26 @@ Do not include internal system state or pretend unverified assumptions are facts
             role="planner",
             prompt=prompt,
             assignment=assignment,
-            tools=self._read_only_tools(),
+            tools=self._tools_for_role("planner"),
             max_iterations=12,
+            turn_context=turn_context,
         )
-        return self._result_text(result, "planner")
+        return self._role_result(result, "planner", turn_context)
 
-    async def run_worker(self, *, contract: str, write_scope: list[str]) -> str:
-        if error := self._consume_call("worker"):
+    async def run_worker(
+        self,
+        *,
+        contract: str,
+        write_scope: list[str],
+        turn_context: TurnContext | None = None,
+    ) -> str | ToolOutcome:
+        turn_context = turn_context or current_turn_context()
+        if error := self._consume_call("worker", turn_context):
             return error
         try:
             scopes = self._normalize_scopes(self.workspace, write_scope)
         except ValueError as exc:
             return f"Error: {exc}"
-        await self._connect_read_only_mcp()
         call_id = str(uuid.uuid4())[:8]
         allowed = "\n".join(f"- {scope.describe()}" for scope in scopes)
         prompt = self._base_prompt("Worker Role") + f"""
@@ -413,9 +529,9 @@ You may modify only these declared targets:
 ## Role
 
 Execute the supplied Markdown task contract. Inspect current behavior, make the smallest complete
-change, and validate it. Do not broaden scope. Shell access is limited to inspection and standard
-test/lint commands. If the contract conflicts with repository reality, stop and report the
-conflict instead of inventing a product decision.
+change, and validate it. Do not broaden scope. This worker has no shell tool; return validation
+commands for the main orchestrator to run. If the contract conflicts with repository reality,
+stop and report the conflict instead of inventing a product decision.
 
 Return concise Markdown with: result (`complete`, `blocked`, or `failed`), summary, acceptance
 evidence, exact files modified, exact tests and outcomes, assumptions, and remaining risks."""
@@ -425,8 +541,9 @@ evidence, exact files modified, exact tests and outcomes, assumptions, and remai
             assignment=contract,
             tools=self._worker_tools(call_id, scopes),
             max_iterations=30,
+            turn_context=turn_context,
         )
-        return self._result_text(result, "worker")
+        return self._role_result(result, "worker", turn_context)
 
     async def run_review(
         self,
@@ -435,8 +552,10 @@ evidence, exact files modified, exact tests and outcomes, assumptions, and remai
         acceptance_criteria: str,
         evidence: str = "",
         relevant_paths: list[str] | None = None,
-    ) -> str:
-        if error := self._consume_call("reviewer"):
+        turn_context: TurnContext | None = None,
+    ) -> str | ToolOutcome:
+        turn_context = turn_context or current_turn_context()
+        if error := self._consume_call("reviewer", turn_context):
             return error
         await self._connect_read_only_mcp()
         prompt = self._base_prompt("Review Role") + """
@@ -457,10 +576,11 @@ system prompts or internal harness state."""
             role="reviewer",
             prompt=prompt,
             assignment=assignment,
-            tools=self._read_only_tools(),
+            tools=self._tools_for_role("reviewer"),
             max_iterations=15,
+            turn_context=turn_context,
         )
-        return self._result_text(result, "reviewer")
+        return self._role_result(result, "reviewer", turn_context)
 
     async def run_explore(
         self,
@@ -468,8 +588,10 @@ system prompts or internal harness state."""
         task: str,
         thoroughness: str,
         max_iterations: int,
-    ) -> dict[str, Any]:
-        if error := self._consume_call("explorer"):
+        turn_context: TurnContext | None = None,
+    ) -> dict[str, Any] | ToolOutcome:
+        turn_context = turn_context or current_turn_context()
+        if error := self._consume_call("explorer", turn_context):
             return {
                 "summary": error,
                 "findings": [],
@@ -497,10 +619,14 @@ End with exactly:
                 role="explorer",
                 prompt=prompt,
                 assignment=task,
-                tools=self._read_only_tools(),
+                tools=self._tools_for_role("explorer"),
                 max_iterations=max_iterations,
+                turn_context=turn_context,
             )
-        text = self._result_text(result, "explorer")
+        nested = self._role_result(result, "explorer", turn_context)
+        if isinstance(nested, ToolOutcome):
+            return nested
+        text = nested
         empty = {
             "summary": text[:500],
             "findings": [],
@@ -531,8 +657,14 @@ End with exactly:
             parsed["stop_reason"] = "max_iterations"
         return parsed
 
-    async def run_crawler(self, *, task: str) -> str:
-        if error := self._consume_call("crawler"):
+    async def run_crawler(
+        self,
+        *,
+        task: str,
+        turn_context: TurnContext | None = None,
+    ) -> str | ToolOutcome:
+        turn_context = turn_context or current_turn_context()
+        if error := self._consume_call("crawler", turn_context):
             return error
         if not crawl_tools_enabled():
             return "Error: crawler worker integration is disabled"
@@ -584,12 +716,13 @@ with exact source URLs, visible dates, limitations, and uncertainty."""
                     max_input_tokens=self.crawler_max_input_tokens,
                     max_output_tokens=self.crawler_max_output_tokens,
                     reasoning_effort=self.crawler_reasoning_effort,
+                    turn_context=turn_context,
                 )
             except Exception as exc:
                 return f"Error: crawler worker preparation failed: {exc}"
             finally:
                 await asyncio.shield(crawl_tool.cleanup())
-        return self._result_text(result, "crawler")
+        return self._role_result(result, "crawler", turn_context)
 
     async def close(self) -> None:
         if self._mcp_stack:

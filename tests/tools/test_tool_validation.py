@@ -1,6 +1,8 @@
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -407,6 +409,44 @@ async def test_exec_timeout_capped_at_max() -> None:
     # Should not raise — just clamp to 600
     result = await tool.execute(command="echo ok", timeout=9999)
     assert "Exit code: 0" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'open -a "chatgpt"',
+        'echo ready && /usr/bin/open -a Safari',
+        'osascript -e \'tell application "Safari" to activate\'',
+        'sudo wmctrl -a Safari',
+        'env DISPLAY=:0 xdotool key alt+Tab',
+    ],
+)
+def test_exec_blocks_shell_desktop_mutation_when_desktop_use_is_active(
+    command: str,
+) -> None:
+    tool = ExecTool(desktop_use_active=True)
+
+    error = tool._guard_command(command, "/tmp")
+
+    assert error is not None
+    assert "desktop_use is enabled" in error
+    assert "without a fallback" in error
+
+
+def test_exec_allows_explicit_desktop_inspection_when_desktop_use_is_active() -> None:
+    tool = ExecTool(desktop_use_active=True)
+
+    error = tool._guard_command("lsappinfo info -only name 123", "/tmp")
+
+    assert error is None
+
+
+def test_exec_desktop_mutation_guard_is_disabled_when_desktop_use_is_inactive() -> None:
+    tool = ExecTool(desktop_use_active=False)
+
+    error = tool._guard_command('open -a "chatgpt"', "/tmp")
+
+    assert error is None
 
 
 async def test_exec_git_push_sets_noninteractive_env(monkeypatch) -> None:

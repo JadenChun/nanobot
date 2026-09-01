@@ -3,17 +3,24 @@
 import asyncio
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
-
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.process import run_owned_process
 
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
+
+    _DESKTOP_MUTATION_COMMAND_RE = re.compile(
+        r"(?:^|(?:&&|\|\||[;|&()\n]))\s*"
+        r"(?:(?:command|exec|nohup|sudo)\s+)*"
+        r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*)?"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+        r"(?:/(?:usr/)?bin/)?(?:open|osascript|xdotool|wmctrl)(?=\s|$)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -28,9 +35,9 @@ class ExecTool(Tool):
     ):
         self.timeout = timeout
         self.working_dir = working_dir
-        # When desktop_use is enabled the exec description warns against
-        # invisible shell escapes for desktop state (osascript, lsappinfo,
-        # AppleScript, ...).
+        # When desktop_use is enabled, shell-based desktop mutation is blocked
+        # by _guard_command. Read-only inspection remains available for tasks
+        # that explicitly request it (for example, querying lsappinfo).
         self.desktop_use_active = bool(desktop_use_active)
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
@@ -62,10 +69,10 @@ class ExecTool(Tool):
         if self.desktop_use_active:
             return (
                 base
-                + " desktop_use is enabled, so DO NOT use this shell to inspect or change "
-                "desktop/window/app state \u2014 no `osascript`, `AppleScript`, `open -a`, "
-                "`lsappinfo`, `wmctrl`, `xdotool`, or similar. Route any UI/desktop/window "
-                "action or check through the `desktop_use` tool (screenshot + pixel coords) instead."
+                + " desktop_use is enabled, so shell-based desktop/window/app mutations "
+                "are blocked \u2014 no `osascript`, `AppleScript`, `open -a`, `wmctrl`, "
+                "`xdotool`, or similar. Route UI actions through `desktop_use`; if it "
+                "fails, report the failure instead of using a shell fallback."
             )
         return base
 
@@ -112,45 +119,29 @@ class ExecTool(Tool):
         self._apply_git_noninteractive_env(command, env)
 
         try:
-            process = await asyncio.create_subprocess_shell(
+            result = await run_owned_process(
                 command,
+                shell=True,
+                timeout=effective_timeout,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=effective_timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                finally:
-                    if sys.platform != "win32":
-                        try:
-                            os.waitpid(process.pid, os.WNOHANG)
-                        except (ProcessLookupError, ChildProcessError) as e:
-                            logger.debug("Process already reaped or not found: {}", e)
+            if result.timed_out:
                 return f"Error: Command timed out after {effective_timeout} seconds"
-
 
             output_parts = []
 
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
+            if result.stdout:
+                output_parts.append(result.stdout.decode("utf-8", errors="replace"))
 
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
+            if result.stderr:
+                stderr_text = result.stderr.decode("utf-8", errors="replace")
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
 
-            output_parts.append(f"\nExit code: {process.returncode}")
+            output_parts.append(f"\nExit code: {result.returncode}")
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
 
@@ -195,6 +186,13 @@ class ExecTool(Tool):
         for pattern in self.deny_patterns:
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
+
+        if self.desktop_use_active and self._DESKTOP_MUTATION_COMMAND_RE.search(cmd):
+            return (
+                "Error: Command blocked because desktop_use is enabled. "
+                "Shell-based desktop mutation is not permitted; use desktop_use or "
+                "report its failure without a fallback."
+            )
 
         if self.allow_patterns:
             if not any(re.search(p, lower) for p in self.allow_patterns):
